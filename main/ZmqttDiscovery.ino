@@ -106,7 +106,7 @@ void announceDeviceTrigger(bool use_gateway_info, char* topic, char* type, char*
   JsonObject sensor = jsonBuffer.to<JsonObject>();
 
   // SET Default Configuration
-  sensor["automation_type"] = "trigger"; // The type of automation, must be ‘trigger’.
+  sensor["atype"] = "trigger"; // The type of automation, must be ‘trigger’.
 
   //SET TYPE
   if (type && type[0] != 0) {
@@ -117,9 +117,9 @@ void announceDeviceTrigger(bool use_gateway_info, char* topic, char* type, char*
 
   //SET SUBTYPE
   if (subtype && subtype[0] != 0) {
-    sensor["subtype"] = subtype;
+    sensor["stype"] = subtype;
   } else {
-    sensor["subtype"] = "turn_on";
+    sensor["stype"] = "turn_on";
   }
 
   /* Set The topic */
@@ -136,20 +136,20 @@ void announceDeviceTrigger(bool use_gateway_info, char* topic, char* type, char*
   /* Set The Devices */
   StaticJsonDocument<JSON_MSG_BUFFER> jsonDeviceBuffer;
   JsonObject device = jsonDeviceBuffer.to<JsonObject>();
-  JsonArray identifiers = device.createNestedArray("identifiers");
+  JsonArray identifiers = device.createNestedArray("ids");
 
   if (use_gateway_info) {
     device["name"] = gateway_name;
 #  ifndef GATEWAY_MODEL
     String model = "";
     serializeJson(modules, model);
-    device["model"] = model;
+    device["mdl"] = model;
 #  else
-    device["model"] = GATEWAY_MODEL;
+    device["mdl"] = GATEWAY_MODEL;
 #  endif
 
-    device["manufacturer"] = GATEWAY_MANUFACTURER;
-    device["sw_version"] = OMG_VERSION;
+    device["mf"] = GATEWAY_MANUFACTURER;
+    device["sw"] = OMG_VERSION;
     identifiers.add(getMacAddress());
 
   } else {
@@ -161,7 +161,7 @@ void announceDeviceTrigger(bool use_gateway_info, char* topic, char* type, char*
 
     /*Set Connection */
     if (device_id && device_id[0] != 0) {
-      JsonArray connections = device.createNestedArray("connections");
+      JsonArray connections = device.createNestedArray("cns");
       JsonArray connection_mac = connections.createNestedArray();
       connection_mac.add("mac");
       connection_mac.add(device_id);
@@ -169,7 +169,7 @@ void announceDeviceTrigger(bool use_gateway_info, char* topic, char* type, char*
 
     //Set manufacturer
     if (device_manufacturer && device_manufacturer[0]) {
-      device["manufacturer"] = device_manufacturer;
+      device["mf"] = device_manufacturer;
     }
 
     //Set name
@@ -179,12 +179,12 @@ void announceDeviceTrigger(bool use_gateway_info, char* topic, char* type, char*
 
     // set The Model
     if (device_model && device_model[0]) {
-      device["model"] = device_model;
+      device["mdl"] = device_model;
     }
 
     device["via_device"] = gateway_name; //device name of the board
   }
-  sensor["device"] = device; //device representing the board
+  sensor["dev"] = device; //device representing the board
 
   /* Publish on the topic */
   String topic_to_publish = String(discovery_prefix) + "/device_automation/" + String(Gateway_Short_Name) + "/" + String(unique_id) + "/config";
@@ -411,7 +411,9 @@ void createDiscovery(const char* sensor_type,
       device["cu"] = String("http://") + String(ETH.localIP().toString()) + String("/"); //configuration_url
 #  endif
     } else {
+#  ifdef ESP32
       device["cu"] = String("http://") + String(WiFi.localIP().toString()) + String("/"); //configuration_url
+#  endif
     }
 
     device["sw"] = OMG_VERSION;
@@ -448,7 +450,7 @@ void createDiscovery(const char* sensor_type,
     device["via_device"] = String(gateway_name); //device name of the board
   }
 
-  sensor["device"] = device;
+  sensor["dev"] = device;
 
   String topic = String(discovery_prefix) + "/" + String(sensor_type) + "/" + String(unique_id) + "/config";
   Log.trace(F("Announce Device %s on  %s" CR), String(sensor_type).c_str(), topic.c_str());

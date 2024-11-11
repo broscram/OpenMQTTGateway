@@ -249,8 +249,8 @@ void SERIALtoX() {
             if (SERIALdata.containsKey("origin") || SERIALdata.containsKey("topic")) {
 #      ifdef SecondaryModule
               // We need to assign the discovery message to the primary module instead of the secondary module
-              if (SERIALdata.containsKey("device") && SERIALdata["device"].containsKey("via_device")) {
-                SERIALdata["device"]["via_device"] = gateway_name;
+              if (SERIALdata.containsKey("dev") && SERIALdata["dev"].containsKey("via_device")) {
+                SERIALdata["dev"]["via_device"] = gateway_name;
               }
 #      endif
               enqueueJsonObject(SERIALdata);
