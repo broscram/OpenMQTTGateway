@@ -113,7 +113,8 @@ void announceDeviceTrigger(bool use_gateway_info,
                            char* device_mac);
 
 #ifdef discovery_Topic //Deprecated - use discovery_Prefix instead
-#  define discovery_Prefix "homeassistant"
+#  pragma message("compiler directive discovery_Topic is deprecated, use discovery_Prefix instead")
+#  define discovery_Prefix discovery_Topic
 #endif
 #ifndef discovery_Prefix
 #  define discovery_Prefix "homeassistant"
@@ -190,7 +191,8 @@ char discovery_prefix[parameters_size + 1] = discovery_Prefix;
 
 // From https://github.com/home-assistant/core/blob/d7ac4bd65379e11461c7ce0893d3533d8d8b8cbf/homeassistant/const.py#L225
 // List of classes available in Home Assistant
-const char* availableHASSClasses[] = {"battery",
+const char* availableHASSClasses[] = {"battery_charging",
+                                      "battery",
                                       "carbon_dioxide",
                                       "carbon_monoxide",
                                       "current",
@@ -210,10 +212,10 @@ const char* availableHASSClasses[] = {"battery",
                                       "pm1",
                                       "pm10",
                                       "pm25",
-                                      "power",
                                       "power_factor",
-                                      "precipitation",
+                                      "power",
                                       "precipitation_intensity",
+                                      "precipitation",
                                       "pressure",
                                       "problem",
                                       "restart",

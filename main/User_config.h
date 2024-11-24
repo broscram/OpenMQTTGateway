@@ -151,14 +151,15 @@
 
 #ifndef JSON_MSG_BUFFER
 #  if defined(ESP32)
-#    define JSON_MSG_BUFFER 816 // adjusted to minimum size covering largest Theengs device JSON properties (RuuviTag_RAWv2)
+#    define JSON_MSG_BUFFER 1024 // adjusted to minimum size covering largest home assistant discovery messages
+#    if MQTT_SECURE_DEFAULT
+#      define JSON_MSG_BUFFER_MAX 2048 // Json message buffer size increased to handle certificate changes through MQTT, used for the queue and the coming MQTT messages
+#    else
+#      define JSON_MSG_BUFFER_MAX 1024 // Minimum size for the cover MQTT discovery message
+#    endif
 #  elif defined(ESP8266)
-#    define JSON_MSG_BUFFER 512 // Json message max buffer size, don't put 768 or higher it is causing unexpected behaviour on ESP8266, certificates handling with ESP8266 is not tested
-#  endif
-#  if MQTT_SECURE_DEFAULT
-#    define JSON_MSG_BUFFER_MAX 2048 // Json message buffer size increased to handle certificate changes through MQTT, used for the queue and the coming MQTT messages
-#  else
-#    define JSON_MSG_BUFFER_MAX 898 // Minimum size for the cover MQTT discovery message
+#    define JSON_MSG_BUFFER     512 // Json message max buffer size, don't put 768 or higher it is causing unexpected behaviour on ESP8266, certificates handling with ESP8266 is not tested
+#    define JSON_MSG_BUFFER_MAX 832 // Minimum size for MQTT discovery message
 #  endif
 #endif
 
@@ -257,10 +258,6 @@ const char* OTAserver_cert = "";
 #  define MQTT_SECURE_SIGNED_CLIENT 0 // If using a signed certificate for the broker and using client certificate/key set this to true or 1
 #endif
 
-#ifndef CNT_DEFAULT_INDEX
-#  define CNT_DEFAULT_INDEX 0 // Default set of connection parameters
-#endif
-
 #ifdef PRIVATE_CERTS
 #  include "certs/private_client_cert.h"
 #  include "certs/private_client_key.h"
@@ -272,6 +269,10 @@ const char* OTAserver_cert = "";
 #endif
 
 #include <string>
+
+#ifndef CNT_DEFAULT_INDEX
+#  define CNT_DEFAULT_INDEX 0 // Default set of connection parameters
+#endif
 
 #if !MQTT_BROKER_MODE
 struct ss_cnt_parameters {
@@ -288,9 +289,6 @@ struct ss_cnt_parameters {
   bool validConnection;
 };
 
-// Index 0 is used for connection parameters provided in the build that can be overloaded by WiFi Manager/Onboarding/WebUI,MQTT
-#  define CNT_DEFAULT_INDEX 0
-// Index 1 and more are used for connection parameters provided at runtime by MQTT
 #  define cnt_parameters_array_size 3
 
 ss_cnt_parameters cnt_parameters_array[cnt_parameters_array_size] = {
@@ -447,8 +445,22 @@ ss_cnt_parameters cnt_parameters_array[cnt_parameters_array_size] = {
 #ifndef LED_NETWORK
 #  define LED_NETWORK 0
 #endif
-#ifndef LED_POWER
-#  define LED_POWER -1
+
+// LED Strip index
+#ifndef STRIP_ERROR
+#  define STRIP_ERROR 0
+#endif
+#ifndef STRIP_PROCESSING
+#  define STRIP_PROCESSING 0
+#endif
+#ifndef STRIP_BROKER
+#  define STRIP_BROKER 0
+#endif
+#ifndef STRIP_NETWORK
+#  define STRIP_NETWORK 0
+#endif
+#ifndef STRIP_POWER
+#  define STRIP_POWER 0
 #endif
 
 // Single standard LED pin
@@ -466,7 +478,6 @@ ss_cnt_parameters cnt_parameters_array[cnt_parameters_array_size] = {
 #  endif
 #endif
 
-// TODO adapt to other boards
 #ifndef DEFAULT_ADJ_BRIGHTNESS
 #  define DEFAULT_ADJ_BRIGHTNESS 255 // Set Default RGB adjustable brightness
 #endif
@@ -568,12 +579,22 @@ ss_cnt_parameters cnt_parameters_array[cnt_parameters_array_size] = {
 #define TimeBetweenCheckingSYS       3600 // time between (s) system checkings (like updates)
 #define TimeLedON                    1 // time LED are ON
 #define InitialMQTTConnectionTimeout 10 // time estimated (s) before the board is connected to MQTT
-#define subjectSYStoMQTT             "/SYStoMQTT" // system parameters
-#define subjectLOGtoMQTT             "/LOGtoMQTT" // log informations
-#define subjectRLStoMQTT             "/RLStoMQTT" // latest release information
-#define subjectMQTTtoSYSset          "/commands/MQTTtoSYS/config"
-#define subjectMQTTtoSYSupdate       "/commands/MQTTtoSYS/firmware_update"
-#define TimeToResetAtStart           5000 // Time we allow the user at start for the reset command by button press
+#ifndef subjectSYStoMQTT
+#  define subjectSYStoMQTT "/SYStoMQTT" // system parameters
+#endif
+#ifndef subjectLOGtoMQTT
+#  define subjectLOGtoMQTT "/LOGtoMQTT" // log informations
+#endif
+#ifndef subjectRLStoMQTT
+#  define subjectRLStoMQTT "/RLStoMQTT" // latest release information
+#endif
+#ifndef subjectMQTTtoSYSset
+#  define subjectMQTTtoSYSset "/commands/MQTTtoSYS/config"
+#endif
+#ifndef subjectMQTTtoSYSupdate
+#  define subjectMQTTtoSYSupdate "/commands/MQTTtoSYS/firmware_update"
+#endif
+#define TimeToResetAtStart 5000 // Time we allow the user at start for the reset command by button press
 /*-------------------DEFINE LOG LEVEL----------------------*/
 #ifndef LOG_LEVEL
 #  define LOG_LEVEL LOG_LEVEL_NOTICE
@@ -610,9 +631,7 @@ void connectMQTT();
 unsigned long uptime();
 bool cmpToMainTopic(const char*, const char*);
 bool pub(const char*, const char*, bool);
-// void pub(const char*, JsonObject&);
 bool pub(const char*, const char*);
-// void pub_custom_topic(const char*, JsonObject&, boolean);
 
 #if defined(ESP32)
 #  include <Preferences.h>
@@ -648,6 +667,7 @@ enum PowerMode { DEACTIVATED = -1,
 struct SYSConfig_s {
   bool mqtt; // if true the gateway will publish the received data on the MQTT broker
   bool serial; // if true the gateway will publish the received data on the SERIAL
+  bool blufi; // if true the gateway will be accesible with blufi
   bool offline;
   bool discovery; // HA discovery convention
   bool ohdiscovery; // OH discovery specificities
@@ -663,6 +683,9 @@ struct SYSConfig_s {
 #ifndef DEFAULT_SERIAL
 #  define DEFAULT_SERIAL false
 #endif
+#ifndef DEFAULT_BLUFI
+#  define DEFAULT_BLUFI true
+#endif
 #ifndef DEFAULT_OFFLINE
 #  define DEFAULT_OFFLINE false
 #endif
@@ -671,9 +694,6 @@ struct SYSConfig_s {
 bool isAduplicateSignal(uint64_t);
 void storeSignalValue(uint64_t);
 #endif
-
-// Origin topics
-#define subjectBTtoMQTT "/BTtoMQTT"
 
 #define convertTemp_CtoF(c) ((c * 1.8) + 32)
 #define convertTemp_FtoC(f) ((f - 32) * 5 / 9)

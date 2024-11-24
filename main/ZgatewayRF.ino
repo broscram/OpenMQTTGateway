@@ -95,18 +95,20 @@ void RFtoMQTTdiscovery(uint64_t MQTTvalue) {
   String discovery_topic = String(subjectRFtoMQTT);
 #    endif
 
-  String theUniqueId = getUniqueId("-" + String(switchRF[0]), "-" + String(switchRF[1]));
+  String theUniqueId = getUniqueId(String(switchRF[0]), "-" + String(switchRF[1]));
+  String subType = String(switchRF[0]);
 
   announceDeviceTrigger(
       false,
       (char*)discovery_topic.c_str(),
-      "", "",
+      "received",
+      (char*)subType.c_str(),
       (char*)theUniqueId.c_str(),
       "", "", "", "");
 }
 #  endif
 
-void RFtoMQTT() {
+void RFtoX() {
   if (mySwitch.available()) {
     StaticJsonDocument<JSON_MSG_BUFFER> RFdataBuffer;
     JsonObject RFdata = RFdataBuffer.to<JsonObject>();
@@ -160,7 +162,7 @@ void RFtoMQTT() {
 }
 
 #  if simpleReceiving
-void MQTTtoRF(char* topicOri, char* datacallback) {
+void XtoRF(const char* topicOri, const char* datacallback) {
 #    ifdef ZradioCC1101 // set Receive off and Transmitt on
   disableCurrentReceiver();
   ELECHOUSE_cc1101.SetTx(RFConfig.frequency);
@@ -224,7 +226,7 @@ void MQTTtoRF(char* topicOri, char* datacallback) {
 #  endif
 
 #  if jsonReceiving
-void MQTTtoRF(char* topicOri, JsonObject& RFdata) { // json object decoding
+void XtoRF(const char* topicOri, JsonObject& RFdata) { // json object decoding
   if (cmpToMainTopic(topicOri, subjectMQTTtoRF)) {
     Log.trace(F("MQTTtoRF json" CR));
     uint64_t data = RFdata["value"];
@@ -236,8 +238,8 @@ void MQTTtoRF(char* topicOri, JsonObject& RFdata) { // json object decoding
       Log.notice(F("RF Protocol:%d" CR), valuePRT);
       Log.notice(F("RF Pulse Lgth: %d" CR), valuePLSL);
       Log.notice(F("Bits nb: %d" CR), valueBITS);
-#    ifdef ZradioCC1101
       disableCurrentReceiver();
+#    ifdef ZradioCC1101
       initCC1101();
       int txPower = RFdata["txpower"] | RF_CC1101_TXPOWER;
       ELECHOUSE_cc1101.setPA((int)txPower);
@@ -252,7 +254,8 @@ void MQTTtoRF(char* topicOri, JsonObject& RFdata) { // json object decoding
       mySwitch.send(data, valueBITS);
       Log.notice(F("MQTTtoRF OK" CR));
       // we acknowledge the sending by publishing the value to an acknowledgement topic, for the moment even if it is a signal repetition we acknowledge also
-      pub(subjectGTWRFtoMQTT, RFdata);
+      RFdata["origin"] = subjectGTWRFtoMQTT;
+      enqueueJsonObject(RFdata);
       mySwitch.setRepeatTransmit(RF_EMITTER_REPEAT); // Restore the default value
     }
 

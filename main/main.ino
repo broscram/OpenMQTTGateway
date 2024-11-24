@@ -56,17 +56,20 @@ ReceivedSignal receivedSignal[] = {{0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0
 #  define struct_size (sizeof(receivedSignal) / sizeof(ReceivedSignal))
 #endif
 
-//Time used to wait for an interval before checking system measures
+//Time used to wait for an interval before measures
 unsigned long timer_sys_measures = 0;
 
 // Time used to wait before system checkings
 unsigned long timer_sys_checks = 0;
 
+// First Start of offline mode modules
+bool firstStart = true;
+
 #define ARDUINOJSON_USE_LONG_LONG     1
 #define ARDUINOJSON_ENABLE_STD_STRING 1
 
 #include <queue>
-int queueLength = 0;
+int queueLength = -1; // We want to give one cycle of the loop before starting modules that are big msgs producers (example BT), to avoid queue overloading
 unsigned long queueLengthSum = 0;
 unsigned long blockedMessages = 0;
 unsigned long receivedMessages = 0;
@@ -247,12 +250,12 @@ char ota_hostname[MAC_NAME_MAX_LEN];
 int failure_number_ntwk = 0; // number of failure connecting to network
 int failure_number_mqtt = 0; // number of failure connecting to MQTT
 
-unsigned long timer_led_measures = 0;
 static unsigned long last_ota_activity_millis = 0;
 // Global struct to store live SYS configuration data
 SYSConfig_s SYSConfig;
 
 bool failSafeMode = false;
+bool ProcessLock = true; // Process lock when we want to use a critical function like OTA for example
 static bool mqttSetupPending = true;
 static int cnt_index = CNT_DEFAULT_INDEX;
 
@@ -265,7 +268,6 @@ static int cnt_index = CNT_DEFAULT_INDEX;
 #  include <nvs_flash.h>
 
 bool BTProcessLock = true; // Process lock when we want to use a critical function like OTA for example, at start to true so as to wait for critical functions to be performed before BLE start
-bool ProcessLock = false; // Process lock when we want to use a critical function like OTA for example
 
 #  if !defined(NO_INT_TEMP_READING)
 // ESP32 internal temperature reading
@@ -372,9 +374,9 @@ void Config_update(JsonObject& data, const char* key, T& var) {
   if (data.containsKey(key)) {
     if (var != data[key].as<T>()) {
       var = data[key].as<T>();
-      Log.notice(F("Config %s changed: %T" CR), key, data[key].as<T>());
+      Log.notice(F("Config %s changed to: %T" CR), key, data[key].as<T>());
     } else {
-      Log.notice(F("Config %s unchanged: %T" CR), key, data[key].as<T>());
+      Log.notice(F("Config %s unchanged, currently: %T" CR), key, data[key].as<T>());
     }
   }
 }
@@ -385,7 +387,7 @@ void Config_update(JsonObject& data, const char* key, T& var) {
 */
 bool jsonDispatch(JsonObject& data) {
   bool res = false;
-  if (data.containsKey("origin")) {
+  if (data.containsKey("origin") || data.containsKey("topic")) {
     GatewayState previousGatewayState = gatewayState;
     gatewayState = GatewayState::PROCESSING;
 #if message_UTCtimestamp == true
@@ -394,26 +396,23 @@ bool jsonDispatch(JsonObject& data) {
 #if message_unixtimestamp == true
     data["unixtime"] = TheengsUtils::unixtimestamp();
 #endif
-    pubWebUI((char*)data["origin"].as<const char*>(), data);
+    if (data.containsKey("origin")) {
+      pubWebUI((char*)data["origin"].as<const char*>(), data);
+    }
     if (SYSConfig.mqtt && !SYSConfig.offline) {
-      res = pub((char*)data["origin"].as<const char*>(), data);
-#ifdef ZgatewayBT
-      if (data.containsKey("distance")) {
-        String topic = String(mqtt_topic) + BTConfig.presenceTopic + String(gateway_name);
-        Log.trace(F("Pub HA Presence %s" CR), topic.c_str());
-        res = pub_custom_topic((char*)topic.c_str(), data, false);
-      }
-#endif
+      res = pub(data);
     }
 #ifdef ZgatewaySERIAL
     if (SYSConfig.serial) {
-      XtoSERIAL("", data);
-      res = true;
+      char jsonStr[JSON_MSG_BUFFER_MAX];
+      serializeJson(data, jsonStr);
+      receivingDATA("", jsonStr);
+      res = true; // Return the state from receivingDATA
     }
 #endif
     gatewayState = previousGatewayState; // restore the previous state
   } else {
-    Log.error(F("No origin in JSON filtered" CR));
+    Log.error(F("No origin or topic in JSON filtered" CR));
     gatewayState = GatewayState::ERROR;
   }
   return res;
@@ -523,11 +522,11 @@ void emptyQueue() {
   if (queueLength > maxQueueLength) {
     maxQueueLength = queueLength;
   }
-  if (queueLength == 0) {
+  if (queueLength <= 0) {
     return;
   }
   Log.trace(F("Dequeue JSON" CR));
-  DynamicJsonDocument jsonBuffer(JSON_MSG_BUFFER);
+  DynamicJsonDocument jsonBuffer(JSON_MSG_BUFFER_MAX);
   JsonObject obj = jsonBuffer.to<JsonObject>();
 #ifdef ESP32
   if (xSemaphoreTake(xQueueMutex, pdMS_TO_TICKS(QueueSemaphoreTimeOutTask)) == pdFALSE) {
@@ -568,22 +567,41 @@ bool pub(const char* topicori, const char* payload, bool retainFlag) {
  * @param topicori suffix to add on default MQTT Topic
  * @param data The Json Object that represents the message
  */
-bool pub(const char* topicori, JsonObject& data) {
+bool pub(JsonObject& data) {
   bool res = false;
   bool ret = sensor_Retain;
   if (data.containsKey("retain") && data["retain"].is<bool>()) {
     ret = data["retain"];
     data.remove("retain");
   }
-  if (data.containsKey("origin")) { // temporary, in the future use this instead of topicori
-    data.remove("origin");
-  }
   if (data.size() == 0) {
     Log.error(F("Empty JSON, not published" CR));
     gatewayState = GatewayState::ERROR;
     return res;
   }
-  String topic = String(mqtt_topic) + String(gateway_name) + String(topicori);
+  String topic;
+  if (data.containsKey("origin") && data["origin"].is<const char*>()) {
+    topic = String(mqtt_topic) + String(gateway_name) + String(data["origin"].as<const char*>());
+    data.remove("origin");
+  } else if (data.containsKey("topic") && data["topic"].is<const char*>()) {
+    topic = data["topic"].as<const char*>();
+    if (data.containsKey("info_topic") && data["info_topic"].is<const char*>()) {
+      // Sometimes it is necessary to provide information about the publishing topic, not just use it.
+      // This is the case, for example, for the RF2MQTT device trigger announcement message where the
+      // temporary variable info_topic provides information about the topic that will be used to publish the message,
+      // and it can be different of current message topic (This is a clever pun, I hope it's clear).
+      data["topic"].set(data["info_topic"]);
+      data.remove("info_topic");
+    } else {
+      data.remove("topic");
+    }
+
+  } else {
+    Log.error(F("No topic or origin in JSON, not published" CR));
+    gatewayState = GatewayState::ERROR;
+    return res;
+  }
+
 #if valueAsATopic
 #  ifdef ZgatewayPilight
   String value = data["value"];
@@ -639,19 +657,6 @@ bool pub(const char* topicori, JsonObject& data) {
 bool pub(const char* topicori, const char* payload) {
   String topic = String(mqtt_topic) + String(gateway_name) + String(topicori);
   return pubMQTT(topic, payload);
-}
-
-/**
- * @brief Publish the payload on the topic with a retention
- *
- * @param topic  The topic where to publish
- * @param data   The Json Object that represents the message
- * @param retain true if you what a retain
- */
-bool pub_custom_topic(const char* topic, JsonObject& data, boolean retain) {
-  String buffer = "";
-  serializeJson(data, buffer);
-  return pubMQTT(topic, buffer.c_str(), retain);
 }
 
 /**
@@ -795,6 +800,9 @@ void SYSConfig_init() {
   SYSConfig.mqtt = DEFAULT_MQTT;
   SYSConfig.serial = DEFAULT_SERIAL;
   SYSConfig.offline = DEFAULT_OFFLINE;
+#if USE_BLUFI
+  SYSConfig.blufi = DEFAULT_BLUFI;
+#endif
 #ifdef ZmqttDiscovery
   SYSConfig.discovery = DEFAULT_DISCOVERY;
   SYSConfig.ohdiscovery = OpenHABDiscovery;
@@ -809,6 +817,9 @@ void SYSConfig_fromJson(JsonObject& SYSdata) {
   Config_update(SYSdata, "mqtt", SYSConfig.mqtt);
   Config_update(SYSdata, "serial", SYSConfig.serial);
   Config_update(SYSdata, "offline", SYSConfig.offline);
+#if USE_BLUFI
+  Config_update(SYSdata, "blufi", SYSConfig.blufi);
+#endif
 #ifdef ZmqttDiscovery
   Config_update(SYSdata, "disc", SYSConfig.discovery);
   Config_update(SYSdata, "ohdisc", SYSConfig.ohdiscovery);
@@ -827,6 +838,9 @@ void SYSConfig_save() {
   SYSdata["serial"] = SYSConfig.serial;
   SYSdata["offline"] = SYSConfig.offline;
   SYSdata["powermode"] = SYSConfig.powerMode;
+#  if USE_BLUFI
+  SYSdata["blufi"] = SYSConfig.blufi;
+#  endif
 #  ifdef ZmqttDiscovery
   SYSdata["disc"] = SYSConfig.discovery;
   SYSdata["ohdisc"] = SYSConfig.ohdiscovery;
@@ -846,6 +860,8 @@ void SYSConfig_save() {}
 #endif
 
 bool cmpToMainTopic(const char* topicOri, const char* toAdd) {
+  if (strcmp(topicOri, toAdd) == 0)
+    return true;
   // Is string "<mqtt_topic><gateway_name><toAdd>" equal to "<topicOri>"?
   // Compare first part with first chunk
   if (strncmp(topicOri, mqtt_topic, strlen(mqtt_topic)) != 0)
@@ -918,6 +934,9 @@ void setupMQTT() {
 
   mqtt.reset(new MQTTServer());
   mqtt->begin();
+#  ifdef ZgatewayBT
+  BTProcessLock = !BTConfig.enabled; // Release BLE processes at start if enabled
+#  endif
 }
 #else
 
@@ -1010,7 +1029,10 @@ void setupMQTT() {
       }
     }
 #  endif
-
+#  ifdef ZgatewayBT
+    BTProcessLock = !BTConfig.enabled; // Release BLE processes at start if enabled
+#  endif
+    ProcessLock = false; // Release the loop process
     displayPrint("MQTT connected");
     Log.notice(F("Connected to broker" CR));
     gatewayState = GatewayState::BROKER_CONNECTED;
@@ -1020,7 +1042,7 @@ void setupMQTT() {
 
     if (cnt_parameters_backup) {
       // this was the first attempt to connect to a new server and it succeeded
-      Log.notice(F("MQTT connection successful" CR));
+      Log.notice(F("MQTT connection parameters %d successful" CR), cnt_index);
       cnt_parameters_array[cnt_index].validConnection = true;
       readCntParameters(cnt_index);
 
@@ -1032,7 +1054,6 @@ void setupMQTT() {
       cnt_parameters_backup.reset();
       ESPRestart(7);
     }
-
     handle_autodiscovery();
   };
 
@@ -1104,16 +1125,20 @@ void setupMQTT() {
     }
   };
 
-  mqtt->subscribe(String(mqtt_topic) + gateway_name + subjectMQTTtoX, receivingMQTT, mqtt_max_payload_size);
+  mqtt->subscribe(String(mqtt_topic) + gateway_name + subjectMQTTtoX, receivingDATA, mqtt_max_payload_size);
 
 #  ifdef ZgatewayRF
   // subject on which other OMG will publish, this OMG will store these msg and by the way don't republish them if they have been already published
-  mqtt->subscribe(subjectMultiGTWRF, receivingMQTT, mqtt_max_payload_size);
+  mqtt->subscribe(subjectMultiGTWRF, receivingDATA, mqtt_max_payload_size);
 #  endif
 
 #  ifdef ZgatewayIR
   // subject on which other OMG will publish, this OMG will store these msg and by the way don't republish them if they have been already published
-  mqtt->subscribe(subjectMultiGTWIR, receivingMQTT, mqtt_max_payload_size);
+  mqtt->subscribe(subjectMultiGTWIR, receivingDATA, mqtt_max_payload_size);
+#  endif
+
+#  if enableMultiGTWSync
+  mqtt->subscribe(String(mqtt_topic) + subjectTrackerSync, receivingDATA, mqtt_max_payload_size);
 #  endif
 
   mqtt->begin();
@@ -1221,65 +1246,65 @@ void updateAndHandleLEDsTask() {
   static GatewayState previousGatewayState;
   if (previousGatewayState != gatewayState) {
 #ifdef LED_POWER
-    ledManager.setMode(0, LED_POWER, LEDManager::STATIC, LED_POWER_COLOR, -1);
+    ledManager.setMode(STRIP_POWER, LED_POWER, LEDManager::STATIC, LED_POWER_COLOR, -1);
 #endif
     switch (gatewayState) {
       case PROCESSING:
 #ifdef LED_PROCESSING
-        ledManager.setMode(0, LED_PROCESSING, LEDManager::BLINK, LED_PROCESSING_COLOR, 3);
+        ledManager.setMode(STRIP_PROCESSING, LED_PROCESSING, LEDManager::BLINK, LED_PROCESSING_COLOR, 3);
 #endif
         break;
       case WAITING_ONBOARDING:
 #ifdef LED_BROKER
-        ledManager.setMode(0, LED_BROKER, LEDManager::STATIC, LED_WAITING_ONBOARD_COLOR, -1);
+        ledManager.setMode(STRIP_BROKER, LED_BROKER, LEDManager::STATIC, LED_WAITING_ONBOARD_COLOR, -1);
 #endif
         break;
       case ONBOARDING:
 #ifdef LED_BROKER
-        ledManager.setMode(0, LED_BROKER, LEDManager::STATIC, LED_ONBOARD_COLOR, -1);
+        ledManager.setMode(STRIP_BROKER, LED_BROKER, LEDManager::STATIC, LED_ONBOARD_COLOR, -1);
 #endif
         break;
       case NTWK_CONNECTED:
 #ifdef LED_NETWORK
-        ledManager.setMode(0, LED_NETWORK, LEDManager::STATIC, LED_NETWORK_OK_COLOR, -1);
+        ledManager.setMode(STRIP_NETWORK, LED_NETWORK, LEDManager::STATIC, LED_NETWORK_OK_COLOR, -1);
 #endif
         break;
       case BROKER_CONNECTED:
 #ifdef LED_BROKER
-        ledManager.setMode(0, LED_BROKER, LEDManager::STATIC, LED_BROKER_OK_COLOR, -1);
+        ledManager.setMode(STRIP_BROKER, LED_BROKER, LEDManager::STATIC, LED_BROKER_OK_COLOR, -1);
 #endif
         break;
       case NTWK_DISCONNECTED:
 #ifdef LED_NETWORK
-        ledManager.setMode(0, LED_NETWORK, LEDManager::BLINK, LED_NETWORK_ERROR_COLOR, -1);
+        ledManager.setMode(STRIP_NETWORK, LED_NETWORK, LEDManager::BLINK, LED_NETWORK_ERROR_COLOR, -1);
 #endif
         break;
       case BROKER_DISCONNECTED:
 #ifdef LED_BROKER
-        ledManager.setMode(0, LED_BROKER, LEDManager::BLINK, LED_BROKER_ERROR_COLOR, -1);
+        ledManager.setMode(STRIP_BROKER, LED_BROKER, LEDManager::BLINK, LED_BROKER_ERROR_COLOR, -1);
 #endif
         break;
       case SLEEPING:
-        ledManager.setMode(0, -1, LEDManager::OFF, 0, -1);
+        ledManager.setMode(-1, -1, LEDManager::OFF, 0, -1);
         break;
       case OFFLINE:
 #ifdef LED_NETWORK
-        ledManager.setMode(0, LED_NETWORK, LEDManager::BLINK, LED_OFFLINE_COLOR, -1);
+        ledManager.setMode(STRIP_NETWORK, LED_NETWORK, LEDManager::BLINK, LED_OFFLINE_COLOR, -1);
 #endif
         break;
       case LOCAL_OTA_IN_PROGRESS:
 #ifdef LED_PROCESSING
-        ledManager.setMode(0, LED_PROCESSING, LEDManager::BLINK, LED_OTA_LOCAL_COLOR, -1);
+        ledManager.setMode(STRIP_PROCESSING, LED_PROCESSING, LEDManager::BLINK, LED_OTA_LOCAL_COLOR, -1);
 #endif
         break;
       case REMOTE_OTA_IN_PROGRESS:
 #ifdef LED_PROCESSING
-        ledManager.setMode(0, LED_PROCESSING, LEDManager::BLINK, LED_OTA_REMOTE_COLOR, -1);
+        ledManager.setMode(STRIP_PROCESSING, LED_PROCESSING, LEDManager::BLINK, LED_OTA_REMOTE_COLOR, -1);
 #endif
         break;
       case ERROR:
 #ifdef LED_ERROR
-        ledManager.setMode(0, LED_ERROR, LEDManager::BLINK, LED_ERROR_COLOR, 3);
+        ledManager.setMode(STRIP_ERROR, LED_ERROR, LEDManager::BLINK, LED_ERROR_COLOR, 3);
 #endif
         break;
       default:
@@ -1305,8 +1330,9 @@ void setup() {
   SYSConfig_init();
   SYSConfig_load();
 
-  if (SYSConfig.offline)
+  if (SYSConfig.offline) {
     gatewayState = GatewayState::OFFLINE;
+  }
 
 #ifdef LED_ADDRESSABLE
 #  ifdef LED_ADDRESSABLE_PIN1
@@ -1314,6 +1340,9 @@ void setup() {
 #  endif
 #  ifdef LED_ADDRESSABLE_PIN2
   ledManager.addLEDStrip(LED_ADDRESSABLE_PIN2, LED_ADDRESSABLE_NUM);
+#  endif
+#  ifdef LED_ADDRESSABLE_PIN3
+  ledManager.addLEDStrip(LED_ADDRESSABLE_PIN3, LED_ADDRESSABLE_NUM);
 #  endif
   ledManager.setBrightness(SYSConfig.rgbbrightness);
 #elif LED_PIN
@@ -1357,11 +1386,7 @@ void setup() {
     gatewayState = GatewayState::ERROR;
   }
 #endif
-#ifdef ESP32
-  //esp_task_wdt_init(GeneralTimeOut, true); //enable panic so ESP32 restarts
-#endif
 /*
- The 2 modules below are not connection dependent so start them before the connectivity functions
  Note that the ONOFF module need to start after the RN8209 so that the overCurrent function is launched after the setup of the sensor
 */
 #ifdef ZsensorRN8209
@@ -1372,21 +1397,27 @@ void setup() {
   setupONOFF();
   modules.add(ZactuatorONOFF);
 #endif
+#ifdef ZgatewaySERIAL
+  setupSERIAL();
+  modules.add(ZgatewaySERIAL);
+#endif
 
 #if defined(ESP32) && defined(USE_BLUFI)
-  startBlufi();
+  if (SYSConfig.blufi)
+    startBlufi();
 #endif
 
 #if defined(ESPWifiManualSetup)
-  setup_wifi();
+  setupWiFiFromBuild();
 #else
-  if (loadConfigFromFlash()) {
+  if (loadConfigFromFlash()) { // Config present
     Log.notice(F("Config loaded from flash" CR));
 #  ifdef ESP32_ETHERNET
     setup_ethernet_esp32();
 #  endif
-    if (!failSafeMode && !ethConnected) setupwifi(false);
-  } else {
+    // If not in failSafeMode and no connection to the network with Ethernet, launch the wifi manager
+    if (!failSafeMode && !ethConnected) setupWiFiManager();
+  } else { // No config in flash
 #  ifdef ESP32_ETHERNET
     setup_ethernet_esp32();
 #  endif
@@ -1398,7 +1429,7 @@ void setup() {
 
     Log.notice(F("No config in flash, launching wifi manager" CR));
     // In failSafeMode we don't want to setup wifi manager as it has already been done before
-    if (!failSafeMode) setupwifi(false);
+    if (!failSafeMode) setupWiFiManager();
   }
 
 #endif
@@ -1567,10 +1598,6 @@ void setup() {
   setupDHT();
   modules.add(ZsensorDHT);
 #endif
-#ifdef ZgatewaySERIAL
-  setupSERIAL();
-  modules.add(ZgatewaySERIAL);
-#endif
 #ifdef ZsensorSHTC3
   setupSHTC3();
 #endif
@@ -1638,7 +1665,7 @@ void setOTA() {
 #ifdef ESP32
     ProcessLock = true;
 #  ifdef ZgatewayBT
-    stopProcessing();
+    stopProcessing(true);
 #  endif
 #endif
     lpDisplayPrint("OTA in progress");
@@ -1745,6 +1772,7 @@ void setupTLS(int index) {
 
 /*
   Reboot for Reason Codes
+  0 - Erase and Restart
   1 - Repeated MQTT Connection Failure
   2 - Repeated WiFi Connection Failure
   3 - Failed WiFiManager configuration portal
@@ -1756,12 +1784,20 @@ void setupTLS(int index) {
   9 - SELFTEST end
 */
 void ESPRestart(byte reason) {
+#ifdef SecondaryModule
+  // Erase the secondary module config
+  String restartCmdStr = "{\"cmd\":\"" + String(restartCmd) + "\"}";
+  Log.notice(F("Restarting secondary module : %s" CR), restartCmdStr.c_str());
+  receivingDATA(subjectMQTTtoSYSsetSecondaryModule, restartCmdStr.c_str());
+  delay(2000);
+#endif
   StaticJsonDocument<128> jsonBuffer;
   JsonObject jsondata = jsonBuffer.to<JsonObject>();
   jsondata["reason"] = reason;
   jsondata["retain"] = true;
   jsondata["uptime"] = uptime();
-  pub(subjectLOGtoMQTT, jsondata);
+  jsondata["origin"] = subjectLOGtoMQTT;
+  pub(jsondata); // We go to MQTT bypassing the queue to ensure the message is sent
   // Clean queue
   while (!jsonQueue.empty()) {
     jsonQueue.pop();
@@ -1775,7 +1811,7 @@ void ESPRestart(byte reason) {
 }
 
 #if defined(ESPWifiManualSetup)
-void setup_wifi() {
+void setupWiFiFromBuild() {
   WiFi.mode(WIFI_STA);
   wifiMulti.addAP(wifi_ssid, wifi_password);
   Log.trace(F("Connecting to %s" CR), wifi_ssid);
@@ -1853,7 +1889,7 @@ void blockingWaitForReset() {
       Log.trace(F("Trigger button Pressed" CR));
       delay(3000); // reset delay hold
       if (digitalRead(TRIGGER_GPIO) == LOW) {
-        Log.trace(F("Button Held" CR));
+        Log.notice(F("Button Held" CR));
 // Switching off the relay during reset or failsafe operations
 #    ifdef ZactuatorONOFF
         uint8_t level = digitalRead(ACTUATOR_ONOFF_GPIO);
@@ -1861,13 +1897,14 @@ void blockingWaitForReset() {
           ActuatorTrigger();
         }
 #    endif
+        gatewayState = GatewayState::WAITING_ONBOARDING;
         // Checking if the flash has already been erased to identify if we erase it or go into failsafe mode
         // going to failsafe mode is done by doing a long button press from a state where the flash has already been erased
         if (SPIFFS.begin()) {
           Log.trace(F("mounted file system" CR));
           if (SPIFFS.exists("/config.json")) {
             Log.notice(F("Erasing ESP Config, restarting" CR));
-            setupwifi(true);
+            eraseConfig();
           }
         }
         delay(30000);
@@ -1875,7 +1912,7 @@ void blockingWaitForReset() {
           Log.notice(F("Going into failsafe mode without peripherals" CR));
           // Failsafe mode enable to connect to Wifi or change the firmware without the peripherals setup
           failSafeMode = true;
-          setupwifi(false);
+          setupWiFiManager();
         }
       }
     }
@@ -2104,8 +2141,9 @@ bool loadConfigFromFlash() {
           strcat(key, index_suffix);
           if (json.containsKey(key)) {
             cnt_parameters_array[i].validConnection = json[key].as<bool>();
-          } else {
-            // For backward compatibility, if valid_cnt is not found, we assume the connection is valid
+          } else if (i == CNT_DEFAULT_INDEX) {
+            // For backward compatibility, if valid_cnt is not found, we assume the connection is valid for CNT_DEFAULT_INDEX
+            Log.warning(F("valid_cnt not found, assuming connection is valid" CR));
             cnt_parameters_array[i].validConnection = true;
           }
         }
@@ -2155,12 +2193,9 @@ bool loadConfigFromFlash() {
   return result;
 }
 
-void setupwifi(bool reset_settings) {
+void setupWiFiManager() {
   delay(10);
   WiFi.mode(WIFI_STA);
-
-  if (reset_settings)
-    eraseAndRestart();
 
 #  ifdef USE_MAC_AS_GATEWAY_NAME
   String s = WiFi.macAddress();
@@ -2275,13 +2310,13 @@ void setupwifi(bool reset_settings) {
       esp_wifi_set_config(WIFI_IF_AP, &conf);
 #  endif
 
-      bool shouldRestart = (gatewayState != GatewayState::BROKER_CONNECTED && gatewayState != GatewayState::NTWK_CONNECTED);
+      bool shouldRestart = (gatewayState != GatewayState::BROKER_CONNECTED && !ethConnected && gatewayState != GatewayState::NTWK_CONNECTED);
 
 #  ifdef USE_BLUFI
       shouldRestart = shouldRestart && !isStaConnecting();
 #  endif
-      // Restart/sleep only if not connected
-      if (shouldRestart) {
+      // Restart/sleep only if not connected and not serial communication mode
+      if (shouldRestart && !SYSConfig.serial) {
 #  ifdef DEEP_SLEEP_IN_US
         sleep();
 #  endif
@@ -2364,9 +2399,6 @@ void setup_ethernet_esp32() {
 #    endif
   if (ethBeginSuccess) {
     Log.notice(F("Ethernet started" CR));
-    Log.notice(F("OpenMQTTGateway MAC: %s" CR), ETH.macAddress().c_str());
-    Log.notice(F("OpenMQTTGateway IP: %s" CR), ETH.localIP().toString().c_str());
-    Log.notice(F("OpenMQTTGateway link speed: %d Mbps" CR), ETH.linkSpeed());
     while (!ethConnected && failure_number_ntwk <= maxConnectionRetryNetwork) {
       delay(500);
       Log.notice(F("." CR));
@@ -2388,9 +2420,9 @@ void WiFiEvent(WiFiEvent_t event) {
       Log.notice(F("Ethernet Connected" CR));
       break;
     case ARDUINO_EVENT_ETH_GOT_IP:
-      Log.trace(F("OpenMQTTGateway MAC: %s" CR), ETH.macAddress().c_str());
-      Log.trace(F("OpenMQTTGateway IP: %s" CR), ETH.localIP().toString().c_str());
-      Log.trace(F("OpenMQTTGateway link speed: %d Mbps" CR), ETH.linkSpeed());
+      Log.notice(F("OpenMQTTGateway Ethernet MAC: %s" CR), ETH.macAddress().c_str());
+      Log.notice(F("OpenMQTTGateway Ethernet IP: %s" CR), ETH.localIP().toString().c_str());
+      Log.notice(F("OpenMQTTGateway Ethernet link speed: %d Mbps" CR), ETH.linkSpeed());
       gatewayState = GatewayState::NTWK_CONNECTED;
       ethConnected = true;
       break;
@@ -2426,7 +2458,7 @@ void sleep() {
 #  endif
   Log.trace(F("Deactivating ESP32 components" CR));
 #  ifdef ZgatewayBT
-  stopProcessing();
+  stopProcessing(true);
   ProcessLock = true;
 #  endif
 #  pragma GCC diagnostic push
@@ -2459,19 +2491,32 @@ void loop() {
 #ifdef ESP8266
   updateAndHandleLEDsTask(); // With ESP8266 we need to update the LEDs in the loop
 #endif
-  if (!SYSConfig.offline) {
+  if (!SYSConfig.offline) { // Online mode
     if (mqttSetupPending) {
       setupMQTT();
       mqttSetupPending = false;
     }
+    // When online the MQTT connection callback release the processes
   }
-
+  if (firstStart) {
+#ifdef ZgatewaySERIAL
+    if (SYSConfig.serial && isSerialReady()) {
+#  ifdef ZgatewayBT
+      BTProcessLock = !BTConfig.enabled;
+#  endif
+      ProcessLock = false;
+      firstStart = false;
+    }
+#else
+    ProcessLock = false;
+    firstStart = false;
+#endif
+  }
   unsigned long now = millis();
 
-  // Switch off of the LED after TimeLedON
-  if (now > (timer_led_measures + (TimeLedON * 1000))) {
-    timer_led_measures = millis();
-  }
+#ifdef ZgatewaySERIAL // Serial is a module and a communication layer so it's always processed
+  SERIALtoX();
+#endif
 
   if (ethConnected || WiFi.status() == WL_CONNECTED) {
     if (ethConnected && WiFi.status() == WL_CONNECTED) {
@@ -2479,6 +2524,17 @@ void loop() {
     }
     ArduinoOTA.handle();
     failure_number_ntwk = 0;
+    if (now > (timer_sys_checks + (TimeBetweenCheckingSYS * 1000)) || !timer_sys_checks) {
+#if message_UTCtimestamp || message_unixtimestamp
+      TheengsUtils::syncNTP();
+#endif
+      if (!timer_sys_checks) { // Update check at start up only
+#if defined(ESP32) && defined(MQTT_HTTPS_FW_UPDATE)
+        checkForUpdates();
+#endif
+      }
+      timer_sys_checks = millis();
+    }
 #if defined(ZwebUI) && defined(ESP32)
     WebUILoop();
 #endif
@@ -2492,45 +2548,8 @@ void loop() {
       if (!discovery_republish_on_reconnect && SYSConfig.discovery && (now > lastDiscovery + DiscoveryAutoOffTimer))
         SYSConfig.discovery = false;
 #endif
-
-      if (now > (timer_sys_measures + (TimeBetweenReadingSYS * 1000)) || !timer_sys_measures) {
-        timer_sys_measures = millis();
-        stateMeasures();
-#ifdef ZgatewayBT
-        stateBTMeasures(false);
-#endif
-#ifdef ZactuatorONOFF
-        stateONOFFMeasures();
-#endif
-#ifdef ZdisplaySSD1306
-        stateSSD1306Display();
-#endif
-#ifdef ZgatewayLORA
-        stateLORAMeasures();
-#endif
-#if defined(ZgatewayRTL_433) || defined(ZgatewayPilight) || defined(ZgatewayRF) || defined(ZgatewayRF2) || defined(ZactuatorSomfy)
-        stateRFMeasures();
-#endif
-#if defined(ZwebUI) && defined(ESP32)
-        stateWebUIStatus();
-#endif
-      }
-      if (now > (timer_sys_checks + (TimeBetweenCheckingSYS * 1000)) || !timer_sys_checks) {
-#if message_UTCtimestamp || message_unixtimestamp
-        TheengsUtils::syncNTP();
-#endif
-        if (!timer_sys_checks) { // Update check at start up only
-#if defined(ESP32) && defined(MQTT_HTTPS_FW_UPDATE)
-          checkForUpdates();
-#endif
-#ifdef ZgatewayBT
-          BTProcessLock = !BTConfig.enabled; // Release BLE processes at start if enabled
-#endif
-        }
-        timer_sys_checks = millis();
-      }
     }
-  } else if (!SYSConfig.offline) { // disconnected from network
+  } else if (!SYSConfig.offline && !SYSConfig.serial) { // disconnected from network
     Log.warning(F("Network disconnected" CR));
     gatewayState = GatewayState::NTWK_DISCONNECTED;
     if (!wifi_reconnect_bypass()) {
@@ -2539,128 +2558,149 @@ void loop() {
       gatewayState = GatewayState::NTWK_CONNECTED;
     }
   }
-// Function that doesn't need an active connection
-#if defined(ZboardM5STICKC) || defined(ZboardM5STICKCP) || defined(ZboardM5STACK) || defined(ZboardM5TOUGH)
-  loopM5();
+  if (!ProcessLock) {
+    if (now > (timer_sys_measures + (TimeBetweenReadingSYS * 1000)) || !timer_sys_measures) {
+      timer_sys_measures = millis();
+      stateMeasures();
+#ifdef ZgatewayBT
+      stateBTMeasures(false);
 #endif
-#if defined(ZdisplaySSD1306)
-  loopSSD1306();
+#ifdef ZactuatorONOFF
+      stateONOFFMeasures();
 #endif
-#ifdef ZsensorBME280
-  MeasureTempHumAndPressure(); //Addon to measure Temperature, Humidity, Pressure and Altitude with a Bosch BME280/BMP280
-#endif
-#ifdef ZsensorHTU21
-  MeasureTempHum(); //Addon to measure Temperature, Humidity, of a HTU21 sensor
-#endif
-#ifdef ZsensorLM75
-  MeasureTemp(); //Addon to measure Temperature of an LM75 sensor
-#endif
-#ifdef ZsensorAHTx0
-  MeasureAHTTempHum(); //Addon to measure Temperature, Humidity, of an 'AHTx0' sensor
-#endif
-#ifdef ZsensorHCSR04
-  MeasureDistance(); //Addon to measure distance with a HC-SR04
-#endif
-#ifdef ZsensorBH1750
-  MeasureLightIntensity(); //Addon to measure Light Intensity with a BH1750
-#endif
-#ifdef ZsensorMQ2
-  MeasureGasMQ2();
-#endif
-#ifdef ZsensorTEMT6000
-  MeasureLightIntensityTEMT6000();
-#endif
-#ifdef ZsensorTSL2561
-  MeasureLightIntensityTSL2561();
-#endif
-#ifdef ZsensorC37_YL83_HMRD
-  MeasureC37_YL83_HMRDWater(); //Addon for leak detection with a C-37 YL-83 H-MRD
-#endif
-#ifdef ZsensorDHT
-  MeasureTempAndHum(); //Addon to measure the temperature with a DHT
-#endif
-#ifdef ZsensorSHTC3
-  MeasureTempAndHum(); //Addon to measure the temperature with a DHT
-#endif
-#ifdef ZsensorDS1820
-  MeasureDS1820Temp(); //Addon to measure the temperature with DS1820 sensor(s)
-#endif
-#ifdef ZsensorINA226
-  MeasureINA226();
-#endif
-#ifdef ZsensorHCSR501
-  MeasureHCSR501();
-#endif
-#ifdef ZsensorGPIOInput
-  MeasureGPIOInput();
-#endif
-#ifdef ZsensorGPIOKeyCode
-  MeasureGPIOKeyCode();
-#endif
-#ifdef ZsensorADC
-  MeasureADC(); //Addon to measure the analog value of analog pin
-#endif
-#ifdef ZsensorTouch
-  MeasureTouch();
+#ifdef ZdisplaySSD1306
+      stateSSD1306Display();
 #endif
 #ifdef ZgatewayLORA
-  LORAtoMQTT();
+      stateLORAMeasures();
+#endif
+#if defined(ZgatewayRTL_433) || defined(ZgatewayPilight) || defined(ZgatewayRF) || defined(ZgatewayRF2) || defined(ZactuatorSomfy)
+      stateRFMeasures();
+#endif
+#if defined(ZwebUI) && defined(ESP32)
+      stateWebUIStatus();
+#endif
+    }
+// Function that doesn't need an active connection
+#if defined(ZboardM5STICKC) || defined(ZboardM5STICKCP) || defined(ZboardM5STACK) || defined(ZboardM5TOUGH)
+    loopM5();
+#endif
+#if defined(ZdisplaySSD1306)
+    loopSSD1306();
+#endif
+#ifdef ZsensorBME280
+    MeasureTempHumAndPressure(); //Addon to measure Temperature, Humidity, Pressure and Altitude with a Bosch BME280/BMP280
+#endif
+#ifdef ZsensorHTU21
+    MeasureTempHum(); //Addon to measure Temperature, Humidity, of a HTU21 sensor
+#endif
+#ifdef ZsensorLM75
+    MeasureTemp(); //Addon to measure Temperature of an LM75 sensor
+#endif
+#ifdef ZsensorAHTx0
+    MeasureAHTTempHum(); //Addon to measure Temperature, Humidity, of an 'AHTx0' sensor
+#endif
+#ifdef ZsensorHCSR04
+    MeasureDistance(); //Addon to measure distance with a HC-SR04
+#endif
+#ifdef ZsensorBH1750
+    MeasureLightIntensity(); //Addon to measure Light Intensity with a BH1750
+#endif
+#ifdef ZsensorMQ2
+    MeasureGasMQ2();
+#endif
+#ifdef ZsensorTEMT6000
+    MeasureLightIntensityTEMT6000();
+#endif
+#ifdef ZsensorTSL2561
+    MeasureLightIntensityTSL2561();
+#endif
+#ifdef ZsensorC37_YL83_HMRD
+    MeasureC37_YL83_HMRDWater(); //Addon for leak detection with a C-37 YL-83 H-MRD
+#endif
+#ifdef ZsensorDHT
+    MeasureTempAndHum(); //Addon to measure the temperature with a DHT
+#endif
+#ifdef ZsensorSHTC3
+    MeasureTempAndHum(); //Addon to measure the temperature with a DHT
+#endif
+#ifdef ZsensorDS1820
+    MeasureDS1820Temp(); //Addon to measure the temperature with DS1820 sensor(s)
+#endif
+#ifdef ZsensorINA226
+    MeasureINA226();
+#endif
+#ifdef ZsensorHCSR501
+    MeasureHCSR501();
+#endif
+#ifdef ZsensorGPIOInput
+    MeasureGPIOInput();
+#endif
+#ifdef ZsensorGPIOKeyCode
+    MeasureGPIOKeyCode();
+#endif
+#ifdef ZsensorADC
+    MeasureADC(); //Addon to measure the analog value of analog pin
+#endif
+#ifdef ZsensorTouch
+    MeasureTouch();
+#endif
+#ifdef ZgatewayLORA
+    LORAtoX();
 #  ifdef ZmqttDiscovery
-  if (SYSConfig.discovery)
-    launchLORADiscovery(false);
+    if (SYSConfig.discovery)
+      launchLORADiscovery(false);
 #  endif
 #endif
 #ifdef ZgatewayRF
-  RFtoMQTT();
+    RFtoX();
 #endif
 #ifdef ZgatewayRF2
-  RF2toMQTT();
+    RF2toX();
 #endif
 #ifdef ZgatewayWeatherStation
-  ZgatewayWeatherStationtoMQTT();
+    ZgatewayWeatherStationtoX();
 #endif
 #ifdef ZgatewayGFSunInverter
-  ZgatewayGFSunInverterMQTT();
+    ZgatewayGFSunInverterMQTT();
 #endif
 #ifdef ZgatewayPilight
-  PilighttoMQTT();
+    PilighttoX();
 #endif
 #ifdef ZgatewayBT
 #  ifdef ZmqttDiscovery
-  if (SYSConfig.discovery)
-    launchBTDiscovery(false);
+    if (SYSConfig.discovery)
+      launchBTDiscovery(false);
 #  endif
 #endif
 #ifdef ZgatewaySRFB
-  SRFBtoMQTT();
+    SRFBtoX();
 #endif
 #ifdef ZgatewayIR
-  IRtoMQTT();
+    IRtoX();
 #endif
 #ifdef Zgateway2G
-  if (_2GtoMQTT())
-    Log.trace(F("2GtoMQTT OK" CR));
+    if (_2GtoX())
+      Log.trace(F("2GtoMQTT OK" CR));
 #endif
 #ifdef ZgatewayRFM69
-  if (RFM69toMQTT())
-    Log.trace(F("RFM69toMQTT OK" CR));
-#endif
-#ifdef ZgatewaySERIAL
-  SERIALtoMQTT();
+    if (RFM69toX())
+      Log.trace(F("RFM69toMQTT OK" CR));
 #endif
 #ifdef ZactuatorFASTLED
-  FASTLEDLoop();
+    FASTLEDLoop();
 #endif
 #ifdef ZactuatorPWM
-  PWMLoop();
+    PWMLoop();
 #endif
 #ifdef ZgatewayRTL_433
-  RTL_433Loop();
+    RTL_433Loop();
 #  ifdef ZmqttDiscovery
-  if (SYSConfig.discovery)
-    launchRTL_433Discovery(false);
+    if (SYSConfig.discovery)
+      launchRTL_433Discovery(false);
 #  endif
 #endif
+  }
   // Empty the queue
   emptyQueue();
   // Sleep if ready
@@ -2705,23 +2745,25 @@ float intTemperatureRead() {
 #endif
 
 /*
- Erase flash and restart the ESP
+ Erase config and restart the ESP
 */
-void eraseAndRestart() {
+void eraseConfig() {
+#ifdef SecondaryModule
+  // Erase the secondary module config
+  String eraseCmdStr = "{\"cmd\":\"" + String(eraseCmd) + "\"}";
+  Log.notice(F("Erasing secondary module config: %s" CR), eraseCmdStr.c_str());
+  receivingDATA(subjectMQTTtoSYSsetSecondaryModule, eraseCmdStr.c_str());
+  delay(2000);
+#endif
   Log.trace(F("Formatting requested, result: %d" CR), SPIFFS.format());
 
 #if defined(ESP8266)
   WiFi.disconnect(true);
-#  ifndef ESPWifiManualSetup
-  wifiManager.resetSettings();
-#  endif
-  delay(5000);
-  ESP.reset();
+  ESP.eraseConfig();
 #else
-  //esp_task_wdt_delete(NULL);
   nvs_flash_erase();
-  ESP.restart();
 #endif
+  ESPRestart(0);
 }
 
 String stateMeasures() {
@@ -2733,6 +2775,11 @@ String stateMeasures() {
 #ifdef LED_ADDRESSABLE
   SYSdata["rgbb"] = SYSConfig.rgbbrightness;
 #endif
+#if USE_BLUFI
+  SYSdata["blufi"] = SYSConfig.blufi;
+#endif
+  SYSdata["mqtt"] = SYSConfig.mqtt;
+  SYSdata["serial"] = SYSConfig.serial;
 #ifdef ZmqttDiscovery
   SYSdata["disc"] = SYSConfig.discovery;
   SYSdata["ohdisc"] = SYSConfig.ohdiscovery;
@@ -2823,6 +2870,7 @@ String stateMeasures() {
 
   String output;
   serializeJson(SYSdata, output);
+  Log.notice(F("SYS json: %s" CR), output.c_str());
   return output;
 }
 
@@ -2880,18 +2928,47 @@ bool isAduplicateSignal(uint64_t value) {
 }
 #endif
 
-void receivingMQTT(char* topicOri, char* datacallback) {
+void receivingDATA(const char* topicOri, const char* datacallback) {
+  std::string strTopicOri = topicOri;
   StaticJsonDocument<JSON_MSG_BUFFER_MAX> jsonBuffer;
   JsonObject jsondata = jsonBuffer.to<JsonObject>();
-  auto error = deserializeJson(jsonBuffer, datacallback);
-  if (error) {
+  DeserializationError error = deserializeJson(jsonBuffer, datacallback);
+  if (error || jsondata.isNull()) {
     Log.error(F("deserialize MQTT data failed: %s" CR), error.c_str());
     gatewayState = GatewayState::ERROR;
     return;
   }
+  if (topicOri == nullptr || strcmp(topicOri, "") == 0) {
+    if (jsondata.containsKey("target") && jsondata["target"].is<const char*>()) {
+      strTopicOri = jsondata["target"].as<const char*>();
+      Log.trace(F("BUS Msg target: %s" CR), strTopicOri.c_str());
+    } else if (jsondata.containsKey("origin") && jsondata["origin"].is<const char*>()) {
+      strTopicOri = jsondata["origin"].as<const char*>();
+      Log.trace(F("BUS Msg origin: %s" CR), strTopicOri.c_str());
+    }
+  } else {
+#if defined(SecondaryModule) // Redirect certain commands to Serial
+    String topicSerial = String(mqtt_topic) + String(gateway_name) + subjectMQTTtoSERIAL;
+    const char* cSecondaryModule = SecondaryModule;
+    if (strcmp(cSecondaryModule, "BT") == 0) {
+      if (cmpToMainTopic(topicOri, subjectMQTTtoBTset)) {
+        strTopicOri = topicSerial.c_str();
+        jsondata["target"] = subjectMQTTtoBTset;
+      } else if (cmpToMainTopic(topicOri, subjectMQTTtoBT)) {
+        strTopicOri = topicSerial.c_str();
+        jsondata["target"] = subjectMQTTtoBT;
+      }
+    }
+    if (cmpToMainTopic(topicOri, subjectMQTTtoSYSsetSecondaryModule)) {
+      strTopicOri = topicSerial.c_str();
+      jsondata["target"] = subjectMQTTtoSYSsetSecondaryModule;
+    }
+#endif
+    Log.trace(F("MQTT Msg topic: %s" CR), strTopicOri.c_str());
+  }
 
 #if defined(ZgatewayRF) || defined(ZgatewayIR) || defined(ZgatewaySRFB) || defined(ZgatewayWeatherStation)
-  if (strstr(topicOri, subjectMultiGTWKey) != NULL) { // storing received value so as to avoid publishing this value if it has been already sent by this or another OpenMQTTGateway
+  if (strstr(strTopicOri.c_str(), subjectMultiGTWKey) != NULL) { // storing received value so as to avoid publishing this value if it has been already sent by this or another OpenMQTTGateway
     uint64_t data = jsondata.isNull() ? strtoull(datacallback, NULL, 10) : jsondata["value"];
     if (data != 0 && !isAduplicateSignal(data)) {
       storeSignalValue(data);
@@ -2906,95 +2983,95 @@ void receivingMQTT(char* topicOri, char* datacallback) {
     //Log.notice(F("[ MQTT->OMG ]: %s" CR), buffer.c_str());
 
 #ifdef ZgatewayPilight // ZgatewayPilight is only defined with json publishing due to its numerous parameters
-    MQTTtoPilight(topicOri, jsondata);
+    XtoPilight(strTopicOri.c_str(), jsondata);
 #endif
 #if defined(ZgatewayRTL_433) || defined(ZgatewayPilight) || defined(ZgatewayRF) || defined(ZgatewayRF2) || defined(ZactuatorSomfy)
-    MQTTtoRFset(topicOri, jsondata);
+    XtoRFset(strTopicOri.c_str(), jsondata);
 #endif
 #if jsonReceiving
 #  ifdef ZgatewayLORA
-    MQTTtoLORA(topicOri, jsondata);
+    XtoLORA(strTopicOri.c_str(), jsondata);
 #  endif
 #  ifdef ZgatewayRF
-    MQTTtoRF(topicOri, jsondata);
+    XtoRF(strTopicOri.c_str(), jsondata);
 #  endif
 #  ifdef ZgatewayRF2
-    MQTTtoRF2(topicOri, jsondata);
+    XtoRF2(strTopicOri.c_str(), jsondata);
 #  endif
 #  ifdef Zgateway2G
-    MQTTto2G(topicOri, jsondata);
+    Xto2G(strTopicOri.c_str(), jsondata);
 #  endif
 #  ifdef ZgatewaySRFB
-    MQTTtoSRFB(topicOri, jsondata);
+    XtoSRFB(strTopicOri.c_str(), jsondata);
 #  endif
 #  ifdef ZgatewayIR
-    MQTTtoIR(topicOri, jsondata);
+    XtoIR(strTopicOri.c_str(), jsondata);
 #  endif
 #  ifdef ZgatewayRFM69
-    MQTTtoRFM69(topicOri, jsondata);
+    XtoRFM69(strTopicOri.c_str(), jsondata);
 #  endif
 #  ifdef ZgatewayBT
-    MQTTtoBT(topicOri, jsondata);
+    XtoBT(strTopicOri.c_str(), jsondata);
 #  endif
 #  ifdef ZactuatorFASTLED
-    MQTTtoFASTLED(topicOri, jsondata);
+    XtoFASTLED(strTopicOri.c_str(), jsondata);
 #  endif
 #  ifdef ZactuatorPWM
-    MQTTtoPWM(topicOri, jsondata);
+    XtoPWM(strTopicOri.c_str(), jsondata);
 #  endif
 #  if defined(ZboardM5STICKC) || defined(ZboardM5STICKCP) || defined(ZboardM5STACK) || defined(ZboardM5TOUGH)
-    MQTTtoM5(topicOri, jsondata);
+    XtoM5(strTopicOri.c_str(), jsondata);
 #  endif
 #  if defined(ZdisplaySSD1306)
-    MQTTtoSSD1306(topicOri, jsondata);
+    XtoSSD1306(strTopicOri.c_str(), jsondata);
 #  endif
 #  ifdef ZactuatorONOFF
-    MQTTtoONOFF(topicOri, jsondata);
+    XtoONOFF(strTopicOri.c_str(), jsondata);
 #  endif
 #  ifdef ZactuatorSomfy
-    MQTTtoSomfy(topicOri, jsondata);
+    XtoSomfy(strTopicOri.c_str(), jsondata);
 #  endif
 #  ifdef ZgatewaySERIAL
-    XtoSERIAL(topicOri, jsondata);
+    XtoSERIAL(strTopicOri.c_str(), jsondata);
 #  endif
 #  ifdef MQTT_HTTPS_FW_UPDATE
-    MQTTHttpsFWUpdate(topicOri, jsondata);
+    MQTTHttpsFWUpdate(strTopicOri.c_str(), jsondata);
 #  endif
 #  if defined(ZwebUI) && defined(ESP32)
-    MQTTtoWebUI(topicOri, jsondata);
+    XtoWebUI(strTopicOri.c_str(), jsondata);
 #  endif
 #endif
 
-    MQTTtoSYS(topicOri, jsondata);
+    XtoSYS(strTopicOri.c_str(), jsondata);
   } else { // not a json object --> simple decoding
 #if simpleReceiving
 #  ifdef ZgatewayLORA
-    MQTTtoLORA(topicOri, datacallback);
+    XtoLORA(strTopicOri.c_str(), datacallback);
 #  endif
 #  ifdef ZgatewayRF
-    MQTTtoRF(topicOri, datacallback);
+    XtoRF(strTopicOri.c_str(), datacallback);
 #  endif
 #  ifdef ZgatewayRF315
-    MQTTtoRF315(topicOri, datacallback);
+    XtoRF315(strTopicOri.c_str(), datacallback);
 #  endif
 #  ifdef ZgatewayRF2
-    MQTTtoRF2(topicOri, datacallback);
+    XtoRF2(strTopicOri.c_str(), datacallback);
 #  endif
 #  ifdef Zgateway2G
-    MQTTto2G(topicOri, datacallback);
+    Xto2G(strTopicOri.c_str(), datacallback);
 #  endif
 #  ifdef ZgatewaySRFB
-    MQTTtoSRFB(topicOri, datacallback);
+    XtoSRFB(strTopicOri.c_str(), datacallback);
 #  endif
 #  ifdef ZgatewayRFM69
-    MQTTtoRFM69(topicOri, datacallback);
+    XtoRFM69(strTopicOri.c_str(), datacallback);
 #  endif
 #  ifdef ZactuatorFASTLED
-    MQTTtoFASTLED(topicOri, datacallback);
+    XtoFASTLED(strTopicOri.c_str(), datacallback);
 #  endif
 #endif
 #ifdef ZactuatorONOFF
-    MQTTtoONOFF(topicOri, datacallback);
+    XtoONOFF(strTopicOri.c_str(), datacallback);
 #endif
   }
 }
@@ -3077,7 +3154,7 @@ bool checkForUpdates() {
 #    include <ESP8266httpUpdate.h>
 #  endif
 
-void MQTTHttpsFWUpdate(char* topicOri, JsonObject& HttpsFwUpdateData) {
+void MQTTHttpsFWUpdate(const char* topicOri, JsonObject& HttpsFwUpdateData) {
   if (strstr(topicOri, subjectMQTTtoSYSupdate) != NULL) {
     const char* version = HttpsFwUpdateData["version"] | "latest";
     if (version && ((strlen(version) != strlen(OMG_VERSION)) || strcmp(version, OMG_VERSION) != 0)) {
@@ -3125,10 +3202,10 @@ void MQTTHttpsFWUpdate(char* topicOri, JsonObject& HttpsFwUpdateData) {
 #  ifdef ESP32
       ProcessLock = true;
 #    ifdef ZgatewayBT
-      stopProcessing();
+      stopProcessing(true);
 #    endif
 #  endif
-      Log.warning(F("Starting firmware update" CR));
+      Log.warning(F("Starting firmware update with %d freeHeap" CR), ESP.getFreeHeap());
       gatewayState = GatewayState::REMOTE_OTA_IN_PROGRESS;
 
       StaticJsonDocument<JSON_MSG_BUFFER> jsondata;
@@ -3170,11 +3247,9 @@ void MQTTHttpsFWUpdate(char* topicOri, JsonObject& HttpsFwUpdateData) {
           mqtt.reset();
           mqttSetupPending = true;
           update_client = *static_cast<WiFiClientSecure*>(eClient.get());
-        } else
-#  endif
-        {
-          TheengsUtils::syncNTP();
         }
+#  endif
+        TheengsUtils::syncNTP();
 
 #  ifdef ESP32
         update_client.setCACert(ota_cert.c_str());
@@ -3260,14 +3335,15 @@ void readCntParameters(int index) {
   jsondata["mqtt_pass"] = generateHash(cnt_parameters_array[index].mqtt_pass);
   jsondata["mqtt_secure"] = cnt_parameters_array[index].isConnectionSecure;
   jsondata["mqtt_validate"] = cnt_parameters_array[index].isCertValidate;
-
-  pub(subjectSYStoMQTT, jsondata);
+  jsondata["origin"] = subjectSYStoMQTT;
+  enqueueJsonObject(jsondata);
 }
 #endif
 
-void MQTTtoSYS(char* topicOri, JsonObject& SYSdata) { // json object decoding
+void XtoSYS(const char* topicOri, JsonObject& SYSdata) { // json object decoding
   if (cmpToMainTopic(topicOri, subjectMQTTtoSYSset)) {
     bool restartESP = false;
+    bool publishState = false;
     Log.trace(F("MQTTtoSYS json" CR));
     if (SYSdata.containsKey("cmd")) {
       const char* cmd = SYSdata["cmd"];
@@ -3275,11 +3351,9 @@ void MQTTtoSYS(char* topicOri, JsonObject& SYSdata) { // json object decoding
       if (strstr(cmd, restartCmd) != NULL) { //restart
         ESPRestart(5);
       } else if (strstr(cmd, eraseCmd) != NULL) { //erase and restart
-#ifndef ESPWifiManualSetup
-        setupwifi(true);
-#endif
-      } else if (strstr(cmd, statusCmd) != NULL) { //erase and restart
-        stateMeasures();
+        eraseConfig();
+      } else if (strstr(cmd, statusCmd) != NULL) {
+        publishState = true;
       }
     }
 #ifdef LED_ADDRESSABLE
@@ -3291,7 +3365,7 @@ void MQTTtoSYS(char* topicOri, JsonObject& SYSdata) { // json object decoding
         updatePowerIndicator();
 #  endif
         Log.notice(F("RGB brightness: %d" CR), SYSConfig.rgbbrightness);
-        stateMeasures();
+        publishState = true;
       } else {
         Log.warning(F("RGB brightness value invalid - ignoring command" CR));
       }
@@ -3301,14 +3375,14 @@ void MQTTtoSYS(char* topicOri, JsonObject& SYSdata) { // json object decoding
     if (SYSdata.containsKey("ohdisc") && SYSdata["ohdisc"].is<bool>()) {
       SYSConfig.ohdiscovery = SYSdata["ohdisc"];
       Log.notice(F("OpenHAB discovery: %T" CR), SYSConfig.ohdiscovery);
-      stateMeasures();
+      publishState = true;
     }
 #endif
-    if (SYSdata.containsKey("wifi_ssid") && SYSdata["wifi_ssid"].is<char*>() && SYSdata.containsKey("wifi_pass") && SYSdata["wifi_pass"].is<char*>()) {
+    if (SYSdata.containsKey("wifi_ssid") && SYSdata["wifi_ssid"].is<const char*>() && SYSdata.containsKey("wifi_pass") && SYSdata["wifi_pass"].is<const char*>()) {
 #ifdef ESP32
       ProcessLock = true;
 #  ifdef ZgatewayBT
-      stopProcessing();
+      stopProcessing(true);
 #  endif
 #endif
       String prev_ssid = WiFi.SSID();
@@ -3334,12 +3408,12 @@ void MQTTtoSYS(char* topicOri, JsonObject& SYSdata) { // json object decoding
       restartESP = true;
     }
 
-    if ((SYSdata.containsKey("mqtt_topic") && SYSdata["mqtt_topic"].is<char*>()) ||
+    if ((SYSdata.containsKey("mqtt_topic") && SYSdata["mqtt_topic"].is<const char*>()) ||
 #ifdef ZmqttDiscovery
-        (SYSdata.containsKey("discovery_prefix") && SYSdata["discovery_prefix"].is<char*>()) ||
+        (SYSdata.containsKey("discovery_prefix") && SYSdata["discovery_prefix"].is<const char*>()) ||
 #endif
-        (SYSdata.containsKey("gateway_name") && SYSdata["gateway_name"].is<char*>()) ||
-        (SYSdata.containsKey("gw_pass") && SYSdata["gw_pass"].is<char*>())) {
+        (SYSdata.containsKey("gateway_name") && SYSdata["gateway_name"].is<const char*>()) ||
+        (SYSdata.containsKey("gw_pass") && SYSdata["gw_pass"].is<const char*>())) {
       if (SYSdata.containsKey("mqtt_topic")) {
         strncpy(mqtt_topic, SYSdata["mqtt_topic"], parameters_size);
       }
@@ -3394,18 +3468,18 @@ void MQTTtoSYS(char* topicOri, JsonObject& SYSdata) { // json object decoding
 
       Log.notice(F("MQTT cnt index %d" CR), cnt_index);
 
-      if (SYSdata.containsKey("mqtt_user") && SYSdata["mqtt_user"].is<char*>() && SYSdata.containsKey("mqtt_pass") && SYSdata["mqtt_pass"].is<char*>()) {
+      if (SYSdata.containsKey("mqtt_user") && SYSdata["mqtt_user"].is<const char*>() && SYSdata.containsKey("mqtt_pass") && SYSdata["mqtt_pass"].is<const char*>()) {
         strcpy(cnt_parameters_array[cnt_index].mqtt_user, SYSdata["mqtt_user"]);
         strcpy(cnt_parameters_array[cnt_index].mqtt_pass, SYSdata["mqtt_pass"]);
         cnt_parameters_array[cnt_index].validConnection = false;
       }
 
-      if (SYSdata.containsKey("mqtt_server") && SYSdata["mqtt_server"].is<char*>()) {
+      if (SYSdata.containsKey("mqtt_server") && SYSdata["mqtt_server"].is<const char*>()) {
         strcpy(cnt_parameters_array[cnt_index].mqtt_server, SYSdata["mqtt_server"]);
         cnt_parameters_array[cnt_index].validConnection = false;
       }
 
-      if (SYSdata.containsKey("mqtt_port") && SYSdata["mqtt_port"].is<char*>()) {
+      if (SYSdata.containsKey("mqtt_port") && SYSdata["mqtt_port"].is<const char*>()) {
         strcpy(cnt_parameters_array[cnt_index].mqtt_port, SYSdata["mqtt_port"]);
         cnt_parameters_array[cnt_index].validConnection = false;
       }
@@ -3421,22 +3495,22 @@ void MQTTtoSYS(char* topicOri, JsonObject& SYSdata) { // json object decoding
       }
 
       // Copy the certs to the memory
-      if (SYSdata.containsKey("mqtt_server_cert") && SYSdata["mqtt_server_cert"].is<char*>()) {
+      if (SYSdata.containsKey("mqtt_server_cert") && SYSdata["mqtt_server_cert"].is<const char*>()) {
         cnt_parameters_array[cnt_index].server_cert = TheengsUtils::processCert(SYSdata["mqtt_server_cert"].as<const char*>());
         Log.trace(F("Assigning server cert %s" CR), generateHash(cnt_parameters_array[cnt_index].server_cert).c_str());
         cnt_parameters_array[cnt_index].validConnection = false;
       }
-      if (SYSdata.containsKey("mqtt_client_cert") && SYSdata["mqtt_client_cert"].is<char*>()) {
+      if (SYSdata.containsKey("mqtt_client_cert") && SYSdata["mqtt_client_cert"].is<const char*>()) {
         cnt_parameters_array[cnt_index].client_cert = TheengsUtils::processCert(SYSdata["mqtt_client_cert"].as<const char*>());
         Log.trace(F("Assigning client cert %s" CR), generateHash(cnt_parameters_array[cnt_index].client_cert).c_str());
         cnt_parameters_array[cnt_index].validConnection = false;
       }
-      if (SYSdata.containsKey("mqtt_client_key") && SYSdata["mqtt_client_key"].is<char*>()) {
+      if (SYSdata.containsKey("mqtt_client_key") && SYSdata["mqtt_client_key"].is<const char*>()) {
         cnt_parameters_array[cnt_index].client_key = TheengsUtils::processCert(SYSdata["mqtt_client_key"].as<const char*>());
         Log.trace(F("Assigning client key %s" CR), generateHash(cnt_parameters_array[cnt_index].client_key).c_str());
         cnt_parameters_array[cnt_index].validConnection = false;
       }
-      if (SYSdata.containsKey("ota_server_cert") && SYSdata["ota_server_cert"].is<char*>()) {
+      if (SYSdata.containsKey("ota_server_cert") && SYSdata["ota_server_cert"].is<const char*>()) {
         cnt_parameters_array[cnt_index].ota_server_cert = TheengsUtils::processCert(SYSdata["ota_server_cert"].as<const char*>());
         Log.trace(F("Assigning OTA server cert %s" CR), generateHash(cnt_parameters_array[cnt_index].ota_server_cert).c_str());
       }
@@ -3454,7 +3528,7 @@ void MQTTtoSYS(char* topicOri, JsonObject& SYSdata) { // json object decoding
 #    ifdef ESP32
       ProcessLock = true;
 #      ifdef ZgatewayBT
-      stopProcessing();
+      stopProcessing(true);
 #      endif
 #    endif
 
@@ -3494,12 +3568,26 @@ void MQTTtoSYS(char* topicOri, JsonObject& SYSdata) { // json object decoding
       SYSConfig.powerMode = SYSdata["powermode"];
       Log.notice(F("Power mode: %d" CR), SYSConfig.powerMode);
     }
+#if USE_BLUFI
+    if (SYSdata.containsKey("blufi") && SYSdata["blufi"].is<bool>()) {
+      bool res = false;
+      if (SYSdata["blufi"] && !SYSConfig.blufi) { // Start Blufi
+        res = startBlufi();
+      } else if (!SYSdata["blufi"] && SYSConfig.blufi) { // Stop Blufi
+        res = stopBlufi();
+      }
+      if (res)
+        SYSConfig.blufi = SYSdata["blufi"];
+      publishState = true;
+      Log.notice(F("Blufi: %T" CR), SYSConfig.blufi);
+    }
+#endif
     if (SYSdata.containsKey("disc")) {
       if (SYSdata["disc"].is<bool>()) {
         if (SYSdata["disc"] == true && SYSConfig.discovery == false)
           lastDiscovery = millis();
         SYSConfig.discovery = SYSdata["disc"];
-        stateMeasures();
+        publishState = true;
         if (SYSConfig.discovery)
           pubMqttDiscovery();
       } else {
@@ -3509,6 +3597,9 @@ void MQTTtoSYS(char* topicOri, JsonObject& SYSdata) { // json object decoding
     }
     if (SYSdata.containsKey("save") && SYSdata["save"].as<bool>()) {
       SYSConfig_save();
+    }
+    if (publishState) {
+      stateMeasures();
     }
     if (restartESP) {
       ESPRestart(7);

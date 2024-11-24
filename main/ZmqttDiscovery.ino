@@ -47,7 +47,7 @@ String getUniqueId(String name, String sufix) {
   return String(uniqueId);
 }
 
-#  ifdef ZgatewayBT
+#  if defined(ZgatewayBT) || defined(SecondaryModule)
 /**
  * Create a discover messages form a list of attribute
  * 
@@ -130,7 +130,7 @@ void announceDeviceTrigger(bool use_gateway_info, char* topic, char* type, char*
     strcat(state_topic, gateway_name);
 
     strcat(state_topic, topic);
-    sensor["topic"] = state_topic;
+    sensor["info_topic"] = state_topic;
   }
 
   /* Set The Devices */
@@ -187,9 +187,11 @@ void announceDeviceTrigger(bool use_gateway_info, char* topic, char* type, char*
   sensor["device"] = device; //device representing the board
 
   /* Publish on the topic */
-  String topic_to_publish = String(discovery_prefix) + "/device_automation/" + String(unique_id) + "/config";
+  String topic_to_publish = String(discovery_prefix) + "/device_automation/" + String(Gateway_Short_Name) + "/" + String(unique_id) + "/config";
   Log.trace(F("Announce Device Trigger  %s" CR), topic_to_publish.c_str());
-  pub_custom_topic((char*)topic_to_publish.c_str(), sensor, true);
+  sensor["topic"] = topic_to_publish;
+  sensor["retain"] = true;
+  enqueueJsonObject(sensor);
 }
 
 /*
@@ -240,7 +242,7 @@ void createDiscovery(const char* sensor_type,
                      const char* payload_available, const char* payload_not_available, bool gateway_entity, const char* cmd_topic,
                      const char* device_name, const char* device_manufacturer, const char* device_model, const char* device_id, bool retainCmd,
                      const char* state_class, const char* state_off, const char* state_on, const char* enum_options, const char* command_template) {
-  StaticJsonDocument<JSON_MSG_BUFFER_MAX> jsonBuffer;
+  StaticJsonDocument<JSON_MSG_BUFFER> jsonBuffer;
   JsonObject sensor = jsonBuffer.to<JsonObject>();
 
   // If a component cannot render it's state (f.i. KAKU relays) no state topic
@@ -450,7 +452,9 @@ void createDiscovery(const char* sensor_type,
 
   String topic = String(discovery_prefix) + "/" + String(sensor_type) + "/" + String(unique_id) + "/config";
   Log.trace(F("Announce Device %s on  %s" CR), String(sensor_type).c_str(), topic.c_str());
-  pub_custom_topic((char*)topic.c_str(), sensor, true);
+  sensor["topic"] = topic;
+  sensor["retain"] = true;
+  enqueueJsonObject(sensor);
 }
 
 void eraseTopic(const char* sensor_type, const char* unique_id) {
@@ -462,7 +466,7 @@ void eraseTopic(const char* sensor_type, const char* unique_id) {
   pubMQTT((char*)topic.c_str(), "", true);
 }
 
-#  ifdef ZgatewayBT
+#  if defined(ZgatewayBT) || defined(SecondaryModule)
 void btPresenceParametersDiscovery() {
   createDiscovery("number", //set Type
                   subjectBTtoMQTT, "BT: Presence/Tracker timeout", (char*)getUniqueId("presenceawaytimer", "").c_str(), //set state_topic,name,uniqueId
@@ -474,33 +478,65 @@ void btPresenceParametersDiscovery() {
                   stateClassNone //State Class
   );
 }
-
 void btScanParametersDiscovery() {
-  if (!BTConfig.adaptiveScan) {
-    createDiscovery("number", //set Type
-                    subjectBTtoMQTT, "BT: Interval between scans", (char*)getUniqueId("interval", "").c_str(), //set state_topic,name,uniqueId
-                    will_Topic, "", "{{ value_json.interval/1000 }}", //set availability_topic,device_class,value_template,
-                    "{\"interval\":{{value*1000}},\"save\":true}", "", "s", //set,payload_on,payload_off,unit_of_meas,
-                    0, //set  off_delay
-                    Gateway_AnnouncementMsg, will_Message, true, subjectMQTTtoBTset, //set,payload_available,payload_not available   ,is a gateway entity, command topic
-                    "", "", "", "", false, // device name, device manufacturer, device model, device ID, retain,
-                    stateClassNone //State Class
-    );
-    createDiscovery("number", //set Type
-                    subjectBTtoMQTT, "BT: Interval between active scans", (char*)getUniqueId("intervalacts", "").c_str(), //set state_topic,name,uniqueId
-                    will_Topic, "", "{{ value_json.intervalacts/1000 }}", //set availability_topic,device_class,value_template,
-                    "{\"intervalacts\":{{value*1000}},\"save\":true}", "", "s", //set,payload_on,payload_off,unit_of_meas,
-                    0, //set  off_delay
-                    Gateway_AnnouncementMsg, will_Message, true, subjectMQTTtoBTset, //set,payload_available,payload_not available   ,is a gateway entity, command topic
-                    "", "", "", "", false, // device name, device manufacturer, device model, device ID, retain,
-                    stateClassNone //State Class
-    );
-  }
+  createDiscovery("number", //set Type
+                  subjectBTtoMQTT, "BT: Interval between scans", (char*)getUniqueId("interval", "").c_str(), //set state_topic,name,uniqueId
+                  will_Topic, "", "{{ value_json.interval/1000 }}", //set availability_topic,device_class,value_template,
+                  "{\"interval\":{{value*1000}},\"save\":true}", "", "s", //set,payload_on,payload_off,unit_of_meas,
+                  0, //set  off_delay
+                  Gateway_AnnouncementMsg, will_Message, true, subjectMQTTtoBTset, //set,payload_available,payload_not available   ,is a gateway entity, command topic
+                  "", "", "", "", false, // device name, device manufacturer, device model, device ID, retain,
+                  stateClassNone //State Class
+  );
+  createDiscovery("number", //set Type
+                  subjectBTtoMQTT, "BT: Interval between active scans", (char*)getUniqueId("intervalacts", "").c_str(), //set state_topic,name,uniqueId
+                  will_Topic, "", "{{ value_json.intervalacts/1000 }}", //set availability_topic,device_class,value_template,
+                  "{\"intervalacts\":{{value*1000}},\"save\":true}", "", "s", //set,payload_on,payload_off,unit_of_meas,
+                  0, //set  off_delay
+                  Gateway_AnnouncementMsg, will_Message, true, subjectMQTTtoBTset, //set,payload_available,payload_not available   ,is a gateway entity, command topic
+                  "", "", "", "", false, // device name, device manufacturer, device model, device ID, retain,
+                  stateClassNone //State Class
+  );
 }
 #  endif
 
 void pubMqttDiscovery() {
   Log.trace(F("omgStatusDiscovery" CR));
+#  ifdef SecondaryModule
+  String uptimeName = "SYS: Uptime " + String(SecondaryModule);
+  String uptimeId = "uptime-" + String(SecondaryModule);
+  createDiscovery("sensor", //set Type
+                  subjectSYStoMQTTSecondaryModule, uptimeName.c_str(), (char*)getUniqueId(uptimeId, "").c_str(), //set state_topic,name,uniqueId
+                  will_Topic, "duration", "{{ value_json.uptime }}", //set availability_topic,device_class,value_template,
+                  "", "", "s", //set,payload_on,payload_off,unit_of_meas,
+                  0, //set  off_delay
+                  Gateway_AnnouncementMsg, will_Message, true, "", //set,payload_available,payload_not available   ,is a gateway entity, command topic
+                  "", "", "", "", false, // device name, device manufacturer, device model, device ID, retain
+                  stateClassMeasurement //State Class
+  );
+  String freememName = "SYS: Free memory " + String(SecondaryModule);
+  String freememId = "freemem-" + String(SecondaryModule);
+  createDiscovery("sensor", //set Type
+                  subjectSYStoMQTTSecondaryModule, freememName.c_str(), (char*)getUniqueId(freememId, "").c_str(), //set state_topic,name,uniqueId
+                  will_Topic, "data_size", "{{ value_json.freemem }}", //set availability_topic,device_class,value_template,
+                  "", "", "B", //set,payload_on,payload_off,unit_of_meas,
+                  0, //set  off_delay
+                  Gateway_AnnouncementMsg, will_Message, true, "", //set,payload_available,payload_not available   ,is a gateway entity, command topic
+                  "", "", "", "", false, // device name, device manufacturer, device model, device ID, retain
+                  stateClassMeasurement //State Class
+  );
+  String restartName = "SYS: Restart " + String(SecondaryModule);
+  String restartId = "restart-" + String(SecondaryModule);
+  createDiscovery("button", //set Type
+                  will_Topic, restartName.c_str(), (char*)getUniqueId(restartId, "").c_str(), //set state_topic,name,uniqueId
+                  will_Topic, "restart", "", //set availability_topic,device_class,value_template,
+                  "{\"cmd\":\"restart\"}", "", "", //set,payload_on,payload_off,unit_of_meas,
+                  0, //set  off_delay
+                  Gateway_AnnouncementMsg, will_Message, true, subjectMQTTtoSYSsetSecondaryModule, //set,payload_available,payload_not available   ,is a gateway entity, command topic
+                  "", "", "", "", false, // device name, device manufacturer, device model, device ID, retain
+                  stateClassNone //State Class
+  );
+#  endif
   createDiscovery("binary_sensor", //set Type
                   will_Topic, "SYS: Connectivity", (char*)getUniqueId("connectivity", "").c_str(), //set state_topic,name,uniqueId
                   will_Topic, "connectivity", "", //set availability_topic,device_class,value_template,
@@ -1201,7 +1237,7 @@ void pubMqttDiscovery() {
   );
 #  endif
 
-#  ifdef ZgatewayBT
+#  if defined(ZgatewayBT) || defined(SecondaryModule)
 #    ifdef ESP32
 
   createDiscovery("number", //set Type

@@ -34,10 +34,35 @@
 SoftwareSerial SERIALSoftSerial(SERIAL_RX_GPIO, SERIAL_TX_GPIO); // RX, TX
 #  endif
 
+#  ifdef ESP32
+SemaphoreHandle_t serialSemaphore = NULL;
+const TickType_t semaphoreTimeout = pdMS_TO_TICKS(1000); // 1 second timeout
+#    undef SEMAPHORE_SERIAL
+#    undef SEMAPHORE_SERIAL_GIVE
+#    define SEMAPHORE_SERIAL      xSemaphoreTake(serialSemaphore, semaphoreTimeout) == pdTRUE
+#    define SEMAPHORE_SERIAL_GIVE xSemaphoreGive(serialSemaphore)
+#  else
+#    undef SEMAPHORE_SERIAL
+#    undef SEMAPHORE_SERIAL_GIVE
+#    define SEMAPHORE_SERIAL true
+#    define SEMAPHORE_SERIAL_GIVE
+#  endif
+
 // use pointer to stream class for serial communication to make code
 // compatible with both softwareSerial as hardwareSerial.
 Stream* SERIALStream = NULL;
-unsigned long msgCount = 0;
+//unsigned long msgCount = 0;
+
+bool receiverReady = false;
+unsigned long lastHeartbeatReceived = 0;
+unsigned long lastHeartbeatAckReceived = 0;
+unsigned long lastHeartbeatSent = 0;
+unsigned long lastHeartbeatAckReceivedCheck = 0;
+const unsigned long heartbeatTimeout = 15000; // 15 seconds timeout for ack
+const unsigned long heartbeatAckCheckInterval = 5000; // Check for ack every 5 seconds
+const unsigned long maxHeartbeatInterval = 60000; // Maximum interval of 1 minute
+unsigned long heartbeatInterval = 5000; // 5 seconds
+bool isOverflow = false;
 
 void setupSERIAL() {
 //Initalize serial port
@@ -93,6 +118,13 @@ void setupSERIAL() {
   Log.notice(F("SERIAL_TX_GPIO: %d" CR), SERIAL_TX_GPIO);
 #  endif
 
+#  ifdef ESP32
+  serialSemaphore = xSemaphoreCreateMutex();
+  if (serialSemaphore == NULL) {
+    Log.error(F("Failed to create serialSemaphore" CR));
+  }
+#  endif
+
   // Flush all bytes in the "link" serial port buffer
   while (SERIALStream->available() > 0)
     SERIALStream->read();
@@ -102,7 +134,7 @@ void setupSERIAL() {
 }
 
 #  if SERIALtoMQTTmode == 0 // Convert received data to single MQTT topic
-void SERIALtoMQTT() {
+void SERIALtoX() {
   // Send all SERIAL output (up to SERIALInPost char revieved) as MQTT message
   //This function is Blocking, but there should only ever be a few bytes, usually an ACK or a NACK.
   if (SERIALStream->available()) {
@@ -127,79 +159,129 @@ void SERIALtoMQTT() {
 }
 
 #  elif SERIALtoMQTTmode == 1 // Convert received JSON data to one or multiple MQTT topics
-void SERIALtoMQTT() {
-  // Assumes valid JSON data at SERIAL interface. Use (nested) keys to split JSON data in separate
-  // sub-MQTT-topics up to the defined nesting level.
-  if (SERIALStream->available()) {
-    // Allocate the JSON document
-    StaticJsonDocument<JSON_MSG_BUFFER> SERIALBuffer;
-    JsonObject SERIALdata = SERIALBuffer.to<JsonObject>();
+void sendHeartbeat() {
+  if (SEMAPHORE_SERIAL) {
+    SERIALStream->print(SERIALPre);
+    SERIALStream->print("{\"type\":\"heartbeat\"}");
+    SERIALStream->print(SERIALPost);
+    SERIALStream->flush();
+    Log.notice(F("Sent Serial heartbeat" CR));
+    SEMAPHORE_SERIAL_GIVE;
+  } else {
+    Log.error(F("Failed to take serialSemaphore" CR));
+  }
+}
 
-    // Read the entire JSON string from the serial stream
-    String jsonString = SERIALStream->readStringUntil('\n');
-    Log.trace(F("SERIAL msg received: %s" CR), jsonString.c_str());
+void sendHeartbeatAck() {
+  if (SEMAPHORE_SERIAL) {
+    SERIALStream->print(SERIALPre);
+    SERIALStream->print("{\"type\":\"heartbeat_ack\"}");
+    SERIALStream->print(SERIALPost);
+    SERIALStream->flush();
+    Log.notice(F("Sent heartbeat ack" CR));
+    SEMAPHORE_SERIAL_GIVE;
+  } else {
+    Log.error(F("Failed to take serialSemaphore" CR));
+  }
+}
 
-    int startIndex = 0;
-    while (startIndex < jsonString.length()) {
-      int endIndex = jsonString.indexOf(SERIALPost, startIndex) + strlen(SERIALPost);
-      if (endIndex == -1) {
-        endIndex = jsonString.length();
-      }
-      // Extract the individual JSON message
-      String singleJsonString = jsonString.substring(startIndex, endIndex);
-      // Check if the JSON string contains the prefix and postfix
-      if (singleJsonString.startsWith(SERIALPre) && singleJsonString.endsWith(SERIALPost)) {
-        // Remove the prefix and postfix
-        singleJsonString = singleJsonString.substring(strlen(SERIALPre), singleJsonString.length() - strlen(SERIALPost));
-      } else {
-        Log.error(F("Invalid SERIAL message format: %s" CR), singleJsonString.c_str());
-        return;
-      }
+void SERIALtoX() {
+  static String buffer = ""; // Static buffer to store incomplete messages
+  unsigned long currentTime = millis();
 
-      // Check if the JSON string is complete (basic check for curly braces)
-      if (singleJsonString.indexOf('{') == -1 || singleJsonString.indexOf('}') == -1) {
-        Log.error(F("Incomplete JSON string: %s" CR), singleJsonString.c_str());
-        return;
-      }
+#    ifdef SENDER_SERIAL_HEARTBEAT
+  // Check if it's time to send a heartbeat and we're not in overflow
+  if (!isOverflow && currentTime - lastHeartbeatSent > heartbeatInterval) {
+    sendHeartbeat();
+    lastHeartbeatSent = currentTime;
+  }
+  if (currentTime - lastHeartbeatAckReceivedCheck > heartbeatAckCheckInterval) {
+    lastHeartbeatAckReceivedCheck = currentTime;
+    // Check if we received an ack for the last heartbeat
+    if (currentTime - lastHeartbeatAckReceived > heartbeatTimeout) {
+      // No ack received, increase the interval (with a maximum limit)
+      unsigned long newHeartbeatInterval = heartbeatInterval * 1.25;
+      heartbeatInterval = min(newHeartbeatInterval, maxHeartbeatInterval);
+      Log.warning(F("No heartbeat ack received. Increasing interval to %lu ms" CR), heartbeatInterval);
+      receiverReady = false;
+    } else {
+      // Ack received, reset the interval
+      heartbeatInterval = 5000;
+    }
+  }
+#    else
+  receiverReady = true;
+#    endif
+  while (SERIALStream->available()) {
+    unsigned long now = millis();
+    char c = SERIALStream->read();
+    buffer += c;
 
-      // Read the JSON document from the JSON string
-      DeserializationError err = deserializeJson(SERIALBuffer, singleJsonString);
+    // Check if we have a complete message
+    if (buffer.startsWith(SERIALPre) && buffer.endsWith(SERIALPost)) {
+      isOverflow = false;
+      // Remove prefix and postfix
+      String jsonString = buffer.substring(strlen(SERIALPre), buffer.length() - strlen(SERIALPost));
+
+      // Allocate the JSON document
+      StaticJsonDocument<JSON_MSG_BUFFER> SERIALBuffer;
+      JsonObject SERIALdata = SERIALBuffer.to<JsonObject>();
+
+      // Deserialize the JSON string
+      DeserializationError err = deserializeJson(SERIALBuffer, jsonString);
 
       if (err == DeserializationError::Ok) {
-        // Check if the JSON object is empty
-        if (SERIALBuffer.isNull() || SERIALBuffer.size() == 0) {
-          Log.error(F("SERIAL data is empty JSON object: %s" CR), jsonString.c_str());
-          return;
-        }
-// JSON received
-#    if jsonPublishing
-        // send as json
-        if (SERIALdata.containsKey("origin")) {
-          if (SERIALdata["origin"] == "BT") {
-//Decode the BT data
-#      ifdef ZgatewayBT
-            SERIALdata.remove("origin");
-            PublishDeviceData(SERIALdata);
-#      endif
-          } else {
-            enqueueJsonObject(SERIALdata);
-          }
+        // Check if this is a heartbeat message
+        if (SERIALdata.containsKey("type") && strcmp(SERIALdata["type"], "heartbeat") == 0) {
+          handleHeartbeat();
+        } else if (SERIALdata.containsKey("type") && strcmp(SERIALdata["type"], "heartbeat_ack") == 0) {
+          lastHeartbeatAckReceived = now;
+          receiverReady = true;
+          Log.notice(F("Heartbeat ack received" CR));
         } else {
-          SERIALdata["origin"] = subjectSERIALtoMQTT;
-          enqueueJsonObject(SERIALdata);
-        }
-
+          // Process normal messages
+          Log.notice(F("SERIAL msg received: %s" CR), jsonString.c_str());
+#    if jsonPublishing
+          if (SERIALdata.containsKey("target")) {
+            receivingDATA("", jsonString.c_str());
+          } else {
+            // send as json
+            if (SERIALdata.containsKey("origin") || SERIALdata.containsKey("topic")) {
+#      ifdef SecondaryModule
+              // We need to assign the discovery message to the primary module instead of the secondary module
+              if (SERIALdata.containsKey("device") && SERIALdata["device"].containsKey("via_device")) {
+                SERIALdata["device"]["via_device"] = gateway_name;
+              }
+#      endif
+              enqueueJsonObject(SERIALdata);
+            } else {
+              SERIALdata["origin"] = subjectSERIALtoMQTT;
+              enqueueJsonObject(SERIALdata);
+            }
+          }
 #    endif
 #    if simplePublishing
-        // send as MQTT topics
-        char topic[mqtt_topic_max_size + 1] = subjectSERIALtoMQTT;
-        sendMQTTfromNestedJson(SERIALBuffer.as<JsonVariant>(), topic, 0, SERIALmaxJSONlevel);
+          // send as MQTT topics
+          char topic[mqtt_topic_max_size + 1] = subjectSERIALtoMQTT;
+          sendMQTTfromNestedJson(SERIALBuffer.as<JsonVariant>(), topic, 0, SERIALmaxJSONlevel);
 #    endif
+        }
       } else {
         // Print error to serial log
         Log.error(F("Error in SERIALJSONtoMQTT, deserializeJson() returned %s" CR), err.c_str());
       }
-      startIndex = endIndex;
+
+      // Clear the buffer for the next message
+      buffer = "";
+    } else if (buffer.endsWith(SERIALPost)) {
+      // If the buffer ends with the postfix but does not start with the prefix, clear it
+      Log.error(F("Buffer error, clearing buffer. Partial content: %s" CR), buffer.c_str());
+      buffer = "";
+    } else if (buffer.length() > JSON_MSG_BUFFER) {
+      // If the buffer gets too large without finding a complete message, clear it
+      Log.error(F("Buffer overflow, clearing buffer. Partial content: %s" CR), buffer.c_str());
+      buffer = "";
+      isOverflow = true;
     }
   }
 }
@@ -242,23 +324,52 @@ void sendMQTTfromNestedJson(JsonVariant obj, char* topic, int level, int maxLeve
 }
 #  endif
 
-void XtoSERIAL(const char* topicOri, JsonObject& SERIALdata) {
-  if (cmpToMainTopic(topicOri, subjectXtoSERIAL) || SYSConfig.serial) {
-    Log.trace(F(" MQTTtoSERIAL" CR));
-    const char* prefix = SERIALdata["prefix"] | SERIALPre;
-    const char* postfix = SERIALdata["postfix"] | SERIALPost;
-    std::string data;
-    SERIALStream->print(prefix);
-    if (SYSConfig.serial) {
-      SERIALdata["msgcount"] = msgCount++;
-      serializeJson(SERIALdata, data);
-    } else if (SERIALdata.containsKey("value")) {
-      data = SERIALdata["value"].as<std::string>();
+bool XtoSERIAL(const char* topicOri, JsonObject& SERIALdata) {
+  bool res = false;
+  if (SEMAPHORE_SERIAL) {
+    if (receiverReady && (cmpToMainTopic(topicOri, subjectMQTTtoSERIAL) ||
+                          (SYSConfig.serial && SERIALdata.containsKey("origin") && SERIALdata["origin"].is<const char*>()) ||
+                          (SYSConfig.serial && SERIALdata.containsKey("topic") && SERIALdata["topic"].is<const char*>()))) {
+      Log.trace(F("XtoSERIAL" CR));
+      // Prepare the data string
+      std::string data;
+      if (SYSConfig.serial ||
+          (SERIALdata.containsKey("origin") && SERIALdata["origin"].is<const char*>()) || // Module like BT to SERIAL
+          (SERIALdata.containsKey("target") && SERIALdata["target"].is<const char*>())) { // Command to send to a specific target example MQTTtoBT through SERIAL
+        //SERIALdata["msgcount"] = msgCount++;
+        serializeJson(SERIALdata, data);
+      } else if (SERIALdata.containsKey("value")) {
+        data = SERIALdata["value"].as<std::string>();
+      }
+
+      // Send the message
+      const char* prefix = SERIALdata["prefix"] | SERIALPre;
+      const char* postfix = SERIALdata["postfix"] | SERIALPost;
+      SERIALStream->print(prefix);
+      SERIALStream->print(data.c_str());
+      SERIALStream->print(postfix);
+      SERIALStream->flush();
+
+      Log.notice(F("[ OMG->SERIAL ] data sent: %s" CR), data.c_str());
+      res = true;
+      delay(100);
     }
-    Log.notice(F("[ OMG->SERIAL ] data: %s" CR), data.c_str());
-    SERIALStream->print(data.c_str());
-    SERIALStream->print(postfix);
-    delay(10);
+    SEMAPHORE_SERIAL_GIVE;
+  } else {
+    Log.error(F("Failed to take serialSemaphore" CR));
+  }
+  return res;
+}
+
+bool isSerialReady() {
+  return receiverReady;
+}
+
+// This function should be called when a heartbeat is received from the emitter
+void handleHeartbeat() {
+  lastHeartbeatReceived = millis();
+  if (gatewayState == GatewayState::BROKER_CONNECTED) {
+    sendHeartbeatAck();
   }
 }
 #endif

@@ -27,10 +27,9 @@
 #define config_BT_h
 
 extern void setupBT();
-extern bool BTtoMQTT();
-extern void MQTTtoBT(char* topicOri, JsonObject& RFdata);
+extern void XtoBT(const char* topicOri, JsonObject& RFdata);
 extern void launchBTDiscovery(bool overrideDiscovery);
-extern void stopProcessing();
+extern void stopProcessing(bool deinit);
 extern String stateBTMeasures(bool);
 
 #ifdef ESP32
@@ -41,6 +40,7 @@ extern String stateBTMeasures(bool);
 #define subjectBTtoMQTT    "/BTtoMQTT"
 #define subjectMQTTtoBTset "/commands/MQTTtoBT/config"
 #define subjectMQTTtoBT    "/commands/MQTTtoBT"
+#define subjectTrackerSync "internal/trackersync"
 // Uncomment to send undecoded device data to another gateway device for decoding
 // #define MQTTDecodeTopic    "undecoded"
 #ifndef UseExtDecoder
@@ -142,6 +142,10 @@ unsigned long scanCount = 0;
 
 #ifndef useBeaconUuidForTopic
 #  define useBeaconUuidForTopic false // define true to use iBeacon UUID as topic, instead of sender (random) MAC address
+#endif
+
+#ifndef enableMultiGTWSync
+#  define enableMultiGTWSync true // //define true to use tracker and closest control devices sync across OpenMQTTGateway and Theengs Gateway gateways
 #endif
 
 /*--------------HOME ASSISTANT ROOM PRESENCE--------------*/
