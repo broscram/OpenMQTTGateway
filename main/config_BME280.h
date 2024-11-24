@@ -44,7 +44,7 @@ extern void MeasureTempHumAndPressure();
 #  define bme280_always true // if false when the current value of the parameter is the same as previous one don't send it by MQTT
 #endif
 #ifndef TimeBetweenReadingbme280
-#  define TimeBetweenReadingbme280 30000
+#  define TimeBetweenReadingbme280 180000
 #endif
 
 /*----------------------------USER PARAMETERS-----------------------------*/

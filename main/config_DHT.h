@@ -33,9 +33,9 @@ extern void MeasureTempAndHum();
 /*-------------DEFINE YOUR MQTT PARAMETERS BELOW----------------*/
 #define DHTTOPIC              "/DHTtoMQTT/dht1"
 #define dht_always            true // if false when the current value for temp or hum is the same as previous one don't send it by MQTT
-#define TimeBetweenReadingDHT 30000 // time between 2 DHT readings
+#define TimeBetweenReadingDHT 180000 // time between 2 DHT readings
 /*-------------DHT SENSOR TYPE-------------*/
-//#define DHT_SENSOR_TYPE DHT11 //uncomment for DHT11 Sensor
+#define DHT_SENSOR_TYPE DHT11 //uncomment for DHT11 Sensor
 //#define DHT_SENSOR_TYPE DHT21 //uncomment for DHT21 Sensor
 #ifndef DHT_SENSOR_TYPE
 #  define DHT_SENSOR_TYPE DHT22 //uncomment for DHT22 Sensor (default for backwards compatibility)
